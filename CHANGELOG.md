@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.9.3 - 2026-10-20
+
+### Added
+
+- open plain HDF5 files (written by h5py or libhdf5, with no `_NCProperties`
+  attribute or dimension scales) through `NcFile::open` as netcdf-c does:
+  datasets without `DIMENSION_LIST` get phony dimensions named by size instead
+  of failing strict metadata validation, and a second axis of the same size is
+  named `dim_<size>_2` rather than reusing the first axis's name (#99)
+
+### Fixed
+
+- fail reads with an error instead of aborting the process on corrupt size
+  fields: classic selections larger than the file are refused before
+  allocating, HDF5 selection and fill buffers are allocated fallibly, and the
+  DEFLATE and LZ4 filters no longer reserve their whole output limit up front
+  (#100)
+
 ## 0.9.2 - 2026-10-18
 
 ### Fixed
