@@ -550,6 +550,34 @@ fn chained_filters_with_intermediates_larger_than_the_chunk() {
 }
 
 #[test]
+fn stale_chunks_outside_the_extent_are_ignored() {
+    // The chunk index still holds the two chunks of rows 2-3 of a 4x4
+    // dataset that shrank to 2x4.
+    let path = skip_if_missing!("stale_chunks.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/data").unwrap();
+    assert_eq!(ds.shape(), &[2, 4]);
+    let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+    assert_eq!(data.as_slice().unwrap(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+    let selection = hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 1,
+                end: 2,
+                step: 1,
+            },
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 0,
+                end: 4,
+                step: 1,
+            },
+        ],
+    };
+    let row: ndarray::ArrayD<i32> = ds.read_slice(&selection).unwrap();
+    assert_eq!(row.as_slice().unwrap(), &[4, 5, 6, 7]);
+}
+
+#[test]
 fn committed_datatype_is_not_exposed_as_group() {
     let path = skip_if_missing!("committed_dtype.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

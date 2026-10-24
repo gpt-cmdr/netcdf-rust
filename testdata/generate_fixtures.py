@@ -10,6 +10,7 @@ relative to this script's location.
 """
 
 import os
+import struct
 import subprocess
 import sys
 import numpy as np
@@ -257,6 +258,25 @@ def generate_hdf5_fixtures(base_dir):
     with h5py.File(path, "w") as f:
         data = np.arange(20, dtype=np.float64).reshape(4, 5)
         f.create_dataset("data", data=data, chunks=(4, 5))
+
+    # ---- 16b. stale_chunks.h5 ----
+    # Tests: chunk index entries wholly outside the dataset's extent, as some
+    # writers leave them when a dataset shrinks. libhdf5 removes such chunks,
+    # so this writes 4x4 int32 values in 2x2 chunks (v1 B-tree index) and then
+    # edits the dataspace to 2x4: the two chunks of rows 2-3 become stale.
+    path = os.path.join(hdf5_dir, "stale_chunks.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest") as f:
+        f.create_dataset(
+            "data", data=np.arange(16, dtype=np.int32).reshape(4, 4), chunks=(2, 2),
+            maxshape=(None, 4)
+        )
+    with open(path, "r+b") as fh:
+        raw = fh.read()
+        dims = struct.pack("<4Q", 4, 4, 0xFFFFFFFFFFFFFFFF, 4)
+        assert raw.count(dims) == 1
+        fh.seek(raw.index(dims))
+        fh.write(struct.pack("<Q", 2))
 
     # ---- 17. committed_dtype.h5 ----
     # Tests: committed (shared) datatype — a named datatype that is shared across datasets.
