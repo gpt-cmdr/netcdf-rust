@@ -32,23 +32,16 @@ pub fn parse(
     length_size: u8,
     msg_size: usize,
 ) -> Result<AttributeMessage> {
-    let start = cursor.position();
-    let version = cursor.read_u8()?;
-
-    let result = match version {
-        1 => parse_v1(cursor, offset_size, length_size),
-        2 => parse_v2(cursor, offset_size, length_size),
-        3 => parse_v3(cursor, offset_size, length_size),
+    // The embedded datatype, dataspace and data must lie within the message:
+    // parse from the message's own bytes, never from the messages after it.
+    let mut message = Cursor::new(cursor.read_bytes(msg_size)?);
+    let version = message.read_u8()?;
+    match version {
+        1 => parse_v1(&mut message, offset_size, length_size),
+        2 => parse_v2(&mut message, offset_size, length_size),
+        3 => parse_v3(&mut message, offset_size, length_size),
         v => Err(Error::UnsupportedAttributeVersion(v)),
-    };
-
-    result.and_then(|msg| {
-        let consumed = (cursor.position() - start) as usize;
-        if consumed < msg_size {
-            cursor.skip(msg_size - consumed)?;
-        }
-        Ok(msg)
-    })
+    }
 }
 
 fn parse_v1(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result<AttributeMessage> {
@@ -97,7 +90,8 @@ fn parse_v1(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
 }
 
 fn parse_v2(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result<AttributeMessage> {
-    let _flags = cursor.read_u8()?;
+    let flags = cursor.read_u8()?;
+    check_flags(flags, 2)?;
     let name_size = cursor.read_u16_le()? as usize;
     let datatype_size = cursor.read_u16_le()? as usize;
     let dataspace_size = cursor.read_u16_le()? as usize;
@@ -133,12 +127,7 @@ fn parse_v3(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
     let datatype_size = cursor.read_u16_le()? as usize;
     let dataspace_size = cursor.read_u16_le()? as usize;
     let _name_encoding = cursor.read_u8()?;
-
-    if (flags & 0x03) != 0 {
-        return Err(Error::InvalidData(
-            "shared datatype/dataspace in attribute v3 is not supported".to_string(),
-        ));
-    }
+    check_flags(flags, 3)?;
 
     // Name — NOT padded in v3
     let name = cursor.read_fixed_string(name_size)?;
@@ -163,6 +152,22 @@ fn parse_v3(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
         dataspace: ds_msg,
         raw_data,
     })
+}
+
+/// Version 2 and 3 attribute flags: bit 0 marks a shared datatype, bit 1 a
+/// shared dataspace; the other bits are reserved.
+fn check_flags(flags: u8, version: u8) -> Result<()> {
+    if flags & !0x03 != 0 {
+        return Err(Error::InvalidData(format!(
+            "reserved flags {flags:#04x} in attribute v{version}"
+        )));
+    }
+    if flags != 0 {
+        return Err(Error::InvalidData(format!(
+            "shared datatype/dataspace in attribute v{version} is not supported"
+        )));
+    }
+    Ok(())
 }
 
 fn attribute_raw_data_size(ds_msg: &dataspace::DataspaceMessage, dtype_size: u32) -> Result<usize> {
@@ -196,6 +201,80 @@ mod tests {
     /// Build a scalar dataspace (v2, rank=0, type=scalar).
     fn scalar_dataspace() -> Vec<u8> {
         vec![0x02, 0x00, 0x00, 0x00]
+    }
+
+    /// A version 2 or 3 scalar u32 attribute "abc" = 99.
+    fn attr(version: u8, flags: u8) -> Vec<u8> {
+        let dt = u32_le_datatype();
+        let ds = scalar_dataspace();
+        let mut data = vec![version, flags];
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&(dt.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(ds.len() as u16).to_le_bytes());
+        if version == 3 {
+            data.push(0x00); // ASCII name
+        }
+        data.extend_from_slice(b"abc\0");
+        data.extend_from_slice(&dt);
+        data.extend_from_slice(&ds);
+        data.extend_from_slice(&99u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn reserved_and_shared_attribute_flags_are_refused() {
+        for version in [2, 3] {
+            let data = attr(version, 0);
+            assert_eq!(
+                parse(&mut Cursor::new(&data), 8, 8, data.len())
+                    .unwrap()
+                    .raw_data,
+                99u32.to_le_bytes()
+            );
+            for flags in [0x04, 0x80] {
+                let data = attr(version, flags);
+                let err = parse(&mut Cursor::new(&data), 8, 8, data.len()).unwrap_err();
+                assert!(
+                    err.to_string().contains("reserved flags"),
+                    "v{version}: {err}"
+                );
+            }
+            // Shared datatype or dataspace: the inline fields are not there.
+            for flags in [0x01, 0x02, 0x03] {
+                let data = attr(version, flags);
+                let err = parse(&mut Cursor::new(&data), 8, 8, data.len()).unwrap_err();
+                assert!(err.to_string().contains("shared"), "v{version}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn attribute_is_parsed_within_its_message() {
+        let data = attr(3, 0);
+
+        // The value runs two bytes past the declared message size: an error,
+        // not two bytes of the next message.
+        let mut overrun = data.clone();
+        overrun.extend_from_slice(&[0xaa; 8]);
+        let mut cursor = Cursor::new(&overrun);
+        assert!(parse(&mut cursor, 8, 8, data.len() - 2).is_err());
+
+        // Trailing padding inside the message is skipped.
+        let mut padded = data.clone();
+        padded.extend_from_slice(&[0; 4]);
+        padded.extend_from_slice(&[0xaa; 4]);
+        let mut cursor = Cursor::new(&padded);
+        let msg = parse(&mut cursor, 8, 8, data.len() + 4).unwrap();
+        assert_eq!(msg.raw_data, 99u32.to_le_bytes());
+        assert_eq!(cursor.position() as usize, data.len() + 4);
+    }
+
+    #[test]
+    fn datatype_larger_than_its_message_is_refused() {
+        let dt = u32_le_datatype();
+        assert!(datatype::parse(&mut Cursor::new(&dt), dt.len()).is_ok());
+        let err = datatype::parse(&mut Cursor::new(&dt), dt.len() - 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
     #[test]
