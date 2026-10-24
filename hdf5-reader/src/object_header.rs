@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn v2_continuation_shorter_than_its_signature_and_checksum_is_an_error() {
-        let data = *b"OCHK    ";
+        let data = *b"OCHK\0\0\0\0";
         let base = Cursor::new(&data);
         for cont_length in [0, 3, 7] {
             let result = ObjectHeader::read_v2_continuation_chunk(
