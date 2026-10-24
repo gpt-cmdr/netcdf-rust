@@ -212,37 +212,29 @@ pub fn apply_pipeline_with_limit(
     Ok(output)
 }
 
+/// Absolute ceiling on one built-in filter's decoded output: one byte past
+/// the largest chunk HDF5 permits, so the usual `expected + 1` limit still
+/// detects over-long streams at the format maximum.
+const MAX_FILTER_OUTPUT: usize = crate::HDF5_MAX_CHUNK_BYTES.saturating_add(1);
+
 fn apply_builtin_filter_with_limit(
     filter: &FilterDescription,
     data: &[u8],
     element_size: usize,
     max_output_len: Option<usize>,
 ) -> Result<Vec<u8>> {
+    // Built-in decoders size their output from file content, so every call is
+    // bounded, including callers that pass no limit.
+    let limit = max_output_len.map_or(MAX_FILTER_OUTPUT, |n| n.min(MAX_FILTER_OUTPUT));
     match filter.id {
-        FILTER_DEFLATE => match max_output_len {
-            Some(max_output_len) => deflate::decompress_with_limit(data, max_output_len),
-            None => deflate::decompress(data),
-        },
+        FILTER_DEFLATE => deflate::decompress_with_limit(data, limit),
         FILTER_SHUFFLE => Ok(shuffle::unshuffle(data, element_size)),
         FILTER_FLETCHER32 => fletcher32::verify_and_strip(data),
         FILTER_SZIP => Err(Error::UnsupportedFilter("szip".into())),
-        FILTER_NBIT => match max_output_len {
-            Some(max_output_len) => {
-                nbit::decompress_with_limit(data, &filter.client_data, max_output_len)
-            }
-            None => nbit::decompress(data, &filter.client_data),
-        },
-        FILTER_SCALEOFFSET => match max_output_len {
-            Some(max_output_len) => {
-                scaleoffset::decompress_with_limit(data, &filter.client_data, max_output_len)
-            }
-            None => scaleoffset::decompress(data, &filter.client_data),
-        },
+        FILTER_NBIT => nbit::decompress_with_limit(data, &filter.client_data, limit),
+        FILTER_SCALEOFFSET => scaleoffset::decompress_with_limit(data, &filter.client_data, limit),
         #[cfg(feature = "lz4")]
-        FILTER_LZ4 => match max_output_len {
-            Some(max_output_len) => lz4::decompress_with_limit(data, max_output_len),
-            None => lz4::decompress(data),
-        },
+        FILTER_LZ4 => lz4::decompress_with_limit(data, limit),
         id => Err(Error::UnsupportedFilter(format!("filter id {}", id))),
     }
 }

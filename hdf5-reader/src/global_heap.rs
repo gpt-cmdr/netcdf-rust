@@ -70,7 +70,9 @@ impl GlobalHeapCollection {
 
         // The collection_size includes the header we just read. Calculate the
         // end boundary so we don't read past it.
-        let collection_end = header_start + collection_size;
+        let collection_end = header_start
+            .checked_add(collection_size)
+            .ok_or_else(|| Error::InvalidData("global heap collection size overflows".into()))?;
 
         let mut objects = Vec::new();
 
@@ -78,7 +80,7 @@ impl GlobalHeapCollection {
             // Check if we have enough room for at least an object header
             // (2 + 2 + 4 + length_size bytes minimum).
             let min_obj_header = 8 + length_size as u64;
-            if cursor.position() + min_obj_header > collection_end {
+            if cursor.position().saturating_add(min_obj_header) > collection_end {
                 break;
             }
 
@@ -95,7 +97,7 @@ impl GlobalHeapCollection {
             let obj_size = cursor.read_length(length_size)?;
 
             // Guard against reading past the collection.
-            if cursor.position() + obj_size > collection_end {
+            if cursor.position().saturating_add(obj_size) > collection_end {
                 return Err(Error::UnexpectedEof {
                     offset: cursor.position(),
                     needed: obj_size,
@@ -103,12 +105,14 @@ impl GlobalHeapCollection {
                 });
             }
 
-            let data = cursor.read_bytes(obj_size as usize)?.to_vec();
+            let obj_len = usize::try_from(obj_size).map_err(|_| {
+                Error::InvalidData("global heap object size exceeds platform usize capacity".into())
+            })?;
+            let data = cursor.read_bytes(obj_len)?.to_vec();
 
             // Object data is padded to an 8-byte boundary.
-            let padded = (obj_size + 7) & !7;
-            let padding = padded - obj_size;
-            if padding > 0 && cursor.position() + padding <= collection_end {
+            let padding = obj_size.wrapping_neg() & 7;
+            if padding > 0 && cursor.position().saturating_add(padding) <= collection_end {
                 cursor.skip(padding as usize)?;
             }
 
@@ -198,6 +202,30 @@ mod tests {
         }
         buf.extend(body);
         buf
+    }
+
+    #[test]
+    fn sizes_that_overflow_are_errors() {
+        // Collection size u64::MAX at offset 8: its end does not fit in u64.
+        let mut data = vec![0u8; 8];
+        let mut gcol = build_gcol(&[(1, 1, b"x")], 8);
+        gcol[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        data.extend(gcol);
+        let mut cursor = Cursor::new(&data);
+        cursor.set_position(8);
+        assert!(matches!(
+            GlobalHeapCollection::parse(&mut cursor, 8, 8),
+            Err(Error::InvalidData(_))
+        ));
+
+        // Object size u64::MAX: past the end of the collection.
+        let mut data = build_gcol(&[(1, 1, b"x")], 8);
+        data[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+        assert!(matches!(
+            GlobalHeapCollection::parse(&mut cursor, 8, 8),
+            Err(Error::UnexpectedEof { .. })
+        ));
     }
 
     #[test]

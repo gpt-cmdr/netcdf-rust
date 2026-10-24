@@ -76,6 +76,15 @@ pub use storage::{
     RangeRequestStorage, Storage, StorageBuffer,
 };
 
+/// Default largest decoded chunk a dataset read will allocate: 256 MiB.
+///
+/// Real HDF5 writers keep chunks far smaller (h5py and netCDF target about
+/// 1-4 MiB). The bound applies before any buffer for the chunk is allocated,
+/// and each parallel decode worker can hold one such chunk.
+pub const DEFAULT_MAX_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+/// Largest decoded chunk the HDF5 format permits (chunk sizes are 32-bit).
+pub const HDF5_MAX_CHUNK_BYTES: usize = u32::MAX as usize;
+
 /// Configuration options for opening an HDF5 file.
 pub struct OpenOptions {
     /// Maximum bytes for the chunk cache. Default: 64 MiB.
@@ -89,6 +98,11 @@ pub struct OpenOptions {
     pub external_file_resolver: Option<Arc<dyn ExternalFileResolver>>,
     /// Optional resolver for HDF5 external links.
     pub external_link_resolver: Option<Arc<dyn ExternalLinkResolver>>,
+    /// Largest decoded chunk (chunk dimensions times element size) a read
+    /// may allocate. Larger chunks are refused with [`Error::ResourceLimit`]
+    /// before allocation. Default: [`DEFAULT_MAX_CHUNK_BYTES`]; values above
+    /// [`HDF5_MAX_CHUNK_BYTES`] are clamped to it.
+    pub max_chunk_bytes: usize,
 }
 
 impl Default for OpenOptions {
@@ -99,7 +113,46 @@ impl Default for OpenOptions {
             filter_registry: None,
             external_file_resolver: None,
             external_link_resolver: None,
+            max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
         }
+    }
+}
+
+impl OpenOptions {
+    /// Set [`OpenOptions::chunk_cache_bytes`].
+    pub fn with_chunk_cache_bytes(mut self, chunk_cache_bytes: usize) -> Self {
+        self.chunk_cache_bytes = chunk_cache_bytes;
+        self
+    }
+
+    /// Set [`OpenOptions::chunk_cache_slots`].
+    pub fn with_chunk_cache_slots(mut self, chunk_cache_slots: usize) -> Self {
+        self.chunk_cache_slots = chunk_cache_slots;
+        self
+    }
+
+    /// Set [`OpenOptions::filter_registry`].
+    pub fn with_filter_registry(mut self, filter_registry: FilterRegistry) -> Self {
+        self.filter_registry = Some(filter_registry);
+        self
+    }
+
+    /// Set [`OpenOptions::external_file_resolver`].
+    pub fn with_external_file_resolver(mut self, resolver: Arc<dyn ExternalFileResolver>) -> Self {
+        self.external_file_resolver = Some(resolver);
+        self
+    }
+
+    /// Set [`OpenOptions::external_link_resolver`].
+    pub fn with_external_link_resolver(mut self, resolver: Arc<dyn ExternalLinkResolver>) -> Self {
+        self.external_link_resolver = Some(resolver);
+        self
+    }
+
+    /// Set [`OpenOptions::max_chunk_bytes`].
+    pub fn with_max_chunk_bytes(mut self, max_chunk_bytes: usize) -> Self {
+        self.max_chunk_bytes = max_chunk_bytes;
+        self
     }
 }
 
@@ -431,6 +484,7 @@ pub(crate) struct FileContext {
     pub(crate) external_file_resolver: Option<Arc<dyn ExternalFileResolver>>,
     pub(crate) external_link_resolver: Option<Arc<dyn ExternalLinkResolver>>,
     pub(crate) external_file_cache: parking_lot::Mutex<HashMap<String, DynStorage>>,
+    pub(crate) max_chunk_bytes: usize,
     sohm_table: OnceLock<std::result::Result<Option<SharedMessageTableRef>, String>>,
     full_file_cache: OnceLock<StorageBuffer>,
 }
@@ -581,6 +635,7 @@ impl Hdf5File {
                 external_file_resolver,
                 external_link_resolver,
                 external_file_cache: parking_lot::Mutex::new(HashMap::new()),
+                max_chunk_bytes: options.max_chunk_bytes.min(HDF5_MAX_CHUNK_BYTES),
                 sohm_table: OnceLock::new(),
                 full_file_cache: OnceLock::new(),
             }),
@@ -733,6 +788,21 @@ impl Hdf5File {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_options_builder_sets_every_field() {
+        let opts = OpenOptions::default()
+            .with_chunk_cache_bytes(1024)
+            .with_chunk_cache_slots(7)
+            .with_filter_registry(FilterRegistry::new())
+            .with_max_chunk_bytes(4096);
+        assert_eq!(opts.chunk_cache_bytes, 1024);
+        assert_eq!(opts.chunk_cache_slots, 7);
+        assert!(opts.filter_registry.is_some());
+        assert!(opts.external_file_resolver.is_none());
+        assert!(opts.external_link_resolver.is_none());
+        assert_eq!(opts.max_chunk_bytes, 4096);
+    }
 
     #[test]
     fn open_options_default() {

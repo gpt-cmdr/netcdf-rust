@@ -170,6 +170,7 @@ impl Nc4File {
                 filter_registry: options.filter_registry,
                 external_file_resolver: options.external_file_resolver,
                 external_link_resolver: options.external_link_resolver,
+                max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
             },
         )?;
         Nc4File::from_hdf5(hdf5, metadata_mode)
@@ -191,6 +192,7 @@ impl Nc4File {
                 filter_registry: options.filter_registry,
                 external_file_resolver: options.external_file_resolver,
                 external_link_resolver: options.external_link_resolver,
+                max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
             },
         )?;
         Nc4File::from_hdf5(hdf5, metadata_mode)
@@ -215,6 +217,7 @@ impl Nc4File {
                 filter_registry: options.filter_registry,
                 external_file_resolver: options.external_file_resolver,
                 external_link_resolver: options.external_link_resolver,
+                max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
             },
         )?;
         Nc4File::from_hdf5(hdf5, metadata_mode)

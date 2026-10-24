@@ -249,7 +249,7 @@ fn unpack_packed(
             .checked_mul(packed.size)
             .ok_or_else(|| filter_error("scaleoffset output offset overflowed"))?;
         let slice = out
-            .get_mut(offset..offset + packed.size)
+            .get_mut(offset..offset.saturating_add(packed.size))
             .ok_or_else(|| filter_error("scaleoffset output range is out of bounds"))?;
 
         match packed.native_order {

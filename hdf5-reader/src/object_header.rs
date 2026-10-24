@@ -485,7 +485,9 @@ impl ObjectHeader {
         // `chunk0_data_size` bytes.  The last 4 bytes of that range are the
         // checksum.
         let messages_start = cursor.position();
-        let chunk0_end = messages_start + chunk0_data_size;
+        let chunk0_end = messages_start
+            .checked_add(chunk0_data_size)
+            .ok_or_else(|| Error::InvalidData("object header chunk size overflows".into()))?;
 
         // The checksum covers everything from "OHDR" through the last byte
         // before the checksum field.
@@ -495,7 +497,11 @@ impl ObjectHeader {
             let mut ck = base.at_offset(chunk0_end)?;
             ck.read_u32_le()?
         };
-        let computed = jenkins_lookup3(&base.data()[checksum_start..checksum_end]);
+        let checksummed = base
+            .data()
+            .get(checksum_start..checksum_end)
+            .ok_or(Error::OffsetOutOfBounds(address))?;
+        let computed = jenkins_lookup3(checksummed);
         if computed != stored_checksum {
             return Err(Error::ChecksumMismatch {
                 expected: stored_checksum,
@@ -946,19 +952,33 @@ impl ObjectHeader {
             return Err(Error::InvalidObjectHeaderSignature);
         }
 
-        let chunk_end = cont_offset + cont_length;
+        // The chunk holds at least its signature and its trailing checksum.
+        if cont_length < 8 {
+            return Err(Error::InvalidData(format!(
+                "object header continuation of {cont_length} bytes is too short"
+            )));
+        }
+        let chunk_end = cont_offset.checked_add(cont_length).ok_or_else(|| {
+            Error::InvalidData("object header continuation range overflows".into())
+        })?;
         // The last 4 bytes of the chunk are the checksum.
         let messages_end = chunk_end - 4;
         let messages_start = cursor.position(); // right after "OCHK"
 
         // Verify checksum: covers "OCHK" through the byte before the checksum.
-        let checksum_start = cont_offset as usize;
-        let checksum_end = messages_end as usize;
+        let checksum_start =
+            usize::try_from(cont_offset).map_err(|_| Error::OffsetOutOfBounds(cont_offset))?;
+        let checksum_end =
+            usize::try_from(messages_end).map_err(|_| Error::OffsetOutOfBounds(messages_end))?;
         let stored_checksum = {
             let mut ck = base.at_offset(messages_end)?;
             ck.read_u32_le()?
         };
-        let computed = jenkins_lookup3(&base.data()[checksum_start..checksum_end]);
+        let checksummed = base
+            .data()
+            .get(checksum_start..checksum_end)
+            .ok_or(Error::OffsetOutOfBounds(cont_offset))?;
+        let computed = jenkins_lookup3(checksummed);
         if computed != stored_checksum {
             return Err(Error::ChecksumMismatch {
                 expected: stored_checksum,
@@ -1030,6 +1050,28 @@ mod tests {
     use super::*;
     use crate::checksum::jenkins_lookup3;
     use crate::storage::BytesStorage;
+
+    #[test]
+    fn v2_continuation_shorter_than_its_signature_and_checksum_is_an_error() {
+        let data = *b"OCHK\0\0\0\0";
+        let base = Cursor::new(&data);
+        for cont_length in [0, 3, 7] {
+            let result = ObjectHeader::read_v2_continuation_chunk(
+                &base,
+                0,
+                cont_length,
+                8,
+                8,
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            assert!(
+                matches!(result, Err(Error::InvalidData(_))),
+                "continuation of {cont_length} bytes"
+            );
+        }
+    }
 
     // ------------------------------------------------------------------
     // Helpers
