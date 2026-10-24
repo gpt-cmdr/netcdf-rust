@@ -118,6 +118,44 @@ impl Default for OpenOptions {
     }
 }
 
+impl OpenOptions {
+    /// Set [`OpenOptions::chunk_cache_bytes`].
+    pub fn with_chunk_cache_bytes(mut self, chunk_cache_bytes: usize) -> Self {
+        self.chunk_cache_bytes = chunk_cache_bytes;
+        self
+    }
+
+    /// Set [`OpenOptions::chunk_cache_slots`].
+    pub fn with_chunk_cache_slots(mut self, chunk_cache_slots: usize) -> Self {
+        self.chunk_cache_slots = chunk_cache_slots;
+        self
+    }
+
+    /// Set [`OpenOptions::filter_registry`].
+    pub fn with_filter_registry(mut self, filter_registry: FilterRegistry) -> Self {
+        self.filter_registry = Some(filter_registry);
+        self
+    }
+
+    /// Set [`OpenOptions::external_file_resolver`].
+    pub fn with_external_file_resolver(mut self, resolver: Arc<dyn ExternalFileResolver>) -> Self {
+        self.external_file_resolver = Some(resolver);
+        self
+    }
+
+    /// Set [`OpenOptions::external_link_resolver`].
+    pub fn with_external_link_resolver(mut self, resolver: Arc<dyn ExternalLinkResolver>) -> Self {
+        self.external_link_resolver = Some(resolver);
+        self
+    }
+
+    /// Set [`OpenOptions::max_chunk_bytes`].
+    pub fn with_max_chunk_bytes(mut self, max_chunk_bytes: usize) -> Self {
+        self.max_chunk_bytes = max_chunk_bytes;
+        self
+    }
+}
+
 /// Resolves file names from HDF5 External Data Files messages to storage.
 ///
 /// Implementations are responsible for their own path security policy. The
@@ -750,6 +788,21 @@ impl Hdf5File {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_options_builder_sets_every_field() {
+        let opts = OpenOptions::default()
+            .with_chunk_cache_bytes(1024)
+            .with_chunk_cache_slots(7)
+            .with_filter_registry(FilterRegistry::new())
+            .with_max_chunk_bytes(4096);
+        assert_eq!(opts.chunk_cache_bytes, 1024);
+        assert_eq!(opts.chunk_cache_slots, 7);
+        assert!(opts.filter_registry.is_some());
+        assert!(opts.external_file_resolver.is_none());
+        assert!(opts.external_link_resolver.is_none());
+        assert_eq!(opts.max_chunk_bytes, 4096);
+    }
 
     #[test]
     fn open_options_default() {
