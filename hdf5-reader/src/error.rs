@@ -131,6 +131,11 @@ pub enum Error {
     #[error("invalid data: {0}")]
     InvalidData(String),
 
+    /// The file asks for more memory than the reader's configured limit
+    /// allows; nothing was allocated.
+    #[error("resource limit: {0}")]
+    ResourceLimit(String),
+
     #[error("slice out of bounds: dimension {dim}, index {index}, size {size}")]
     SliceOutOfBounds { dim: usize, index: u64, size: u64 },
 

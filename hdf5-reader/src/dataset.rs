@@ -2213,6 +2213,15 @@ impl Dataset {
             chunk_offsets: smallvec::SmallVec::from_slice(&entry.offsets),
         };
         let expected_len = decoded_chunk_expected_len(chunk_shape, elem_size)?;
+        // Chunk dimensions come from the file and are not bounded by the
+        // dataset extent, so a tiny dataset can declare a huge chunk. Refuse it
+        // before the cache, the raw read or any filter allocates for it.
+        if expected_len > self.context.max_chunk_bytes {
+            return Err(Error::ResourceLimit(format!(
+                "decoded chunk of {expected_len} bytes exceeds the {} byte chunk limit",
+                self.context.max_chunk_bytes
+            )));
+        }
         let filter_output_limit =
             checked_add_usize(expected_len, 1, "decoded chunk filter output limit")?;
 
@@ -4159,6 +4168,7 @@ mod tests {
             external_file_resolver: None,
             external_link_resolver: None,
             external_file_cache: Mutex::new(HashMap::new()),
+            max_chunk_bytes: crate::DEFAULT_MAX_CHUNK_BYTES,
             sohm_table: OnceLock::new(),
             full_file_cache: OnceLock::new(),
         })

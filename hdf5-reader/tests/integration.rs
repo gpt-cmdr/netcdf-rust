@@ -478,6 +478,41 @@ fn soft_link_cycles_fail_to_resolve() {
 }
 
 #[test]
+fn chunks_larger_than_the_chunk_limit_are_refused() {
+    // 5x10 float32 chunks: 200 bytes each.
+    let path = skip_if_missing!("simple_chunked_deflate.h5");
+    let open = |max_chunk_bytes| {
+        hdf5_reader::Hdf5File::open_with_options(
+            &path,
+            hdf5_reader::OpenOptions {
+                max_chunk_bytes,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+
+    let file = open(199);
+    let err = file
+        .dataset("/temperature")
+        .unwrap()
+        .read_array::<f32>()
+        .unwrap_err();
+    let mut source = &err;
+    while let hdf5_reader::error::Error::Context { source: inner, .. } = source {
+        source = inner;
+    }
+    assert!(
+        matches!(source, hdf5_reader::error::Error::ResourceLimit(_)),
+        "{err}"
+    );
+
+    let file = open(200);
+    let data: ndarray::ArrayD<f32> = file.dataset("/temperature").unwrap().read_array().unwrap();
+    assert_eq!(data.shape(), &[10, 20]);
+}
+
+#[test]
 fn external_link_resolver() {
     let path = skip_if_missing!("external_links.h5");
     let base_dir = path.parent().unwrap();
