@@ -147,6 +147,21 @@ def generate_hdf5_fixtures(base_dir):
         data = np.arange(20, dtype=np.float64).reshape(4, 5)
         f.create_dataset("data", data=data)
 
+    # ---- 10d. old_format_soft_links.h5 ----
+    # Tests: soft links in v1 (symbol table) groups. Their symbol table entries
+    # hold no object header address; the scratch pad holds the local heap offset
+    # of the link value instead.
+    path = os.path.join(hdf5_dir, "old_format_soft_links.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest", track_order=False) as f:
+        f.create_dataset("data", data=np.arange(5, dtype=np.int32))
+        g = f.create_group("group")
+        g.create_dataset("inner", data=np.array([7, 8], dtype=np.int32))
+        f["link"] = h5py.SoftLink("/data")
+        f["group_link"] = h5py.SoftLink("/group")
+        g["relative"] = h5py.SoftLink("inner")
+        g["dangling"] = h5py.SoftLink("/missing")
+
     # ---- 10b. compound_v1_floats.h5 ----
     # Tests: version 1 compound datatype (earliest format) whose member names start off
     # the 8-byte grid: a float member (20-byte description) followed by a fixed-length

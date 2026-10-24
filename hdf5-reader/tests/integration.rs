@@ -453,6 +453,61 @@ fn external_raw_data_file_requires_resolver() {
 }
 
 #[test]
+fn old_format_soft_links() {
+    // Symbol table entries of soft links cache the link value instead of an
+    // object header address.
+    let path = skip_if_missing!("old_format_soft_links.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let link: ndarray::ArrayD<i32> = file.dataset("/link").unwrap().read_array().unwrap();
+    assert_eq!(link.as_slice().unwrap(), &[0, 1, 2, 3, 4]);
+    let relative: ndarray::ArrayD<i32> = file
+        .dataset("/group/relative")
+        .unwrap()
+        .read_array()
+        .unwrap();
+    assert_eq!(relative.as_slice().unwrap(), &[7, 8]);
+    let inner: ndarray::ArrayD<i32> = file
+        .group("/group_link")
+        .unwrap()
+        .dataset("inner")
+        .unwrap()
+        .read_array()
+        .unwrap();
+    assert_eq!(inner.as_slice().unwrap(), &[7, 8]);
+
+    let root = file.root_group().unwrap();
+    let mut names: Vec<String> = root
+        .datasets()
+        .unwrap()
+        .iter()
+        .map(|ds| ds.name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["data", "link"]);
+    let mut groups: Vec<String> = root
+        .groups()
+        .unwrap()
+        .iter()
+        .map(|g| g.name().to_string())
+        .collect();
+    groups.sort();
+    assert_eq!(groups, ["group", "group_link"]);
+
+    // A dangling soft link is not listed, as in new-style groups.
+    let group = file.group("/group").unwrap();
+    let mut names: Vec<String> = group
+        .datasets()
+        .unwrap()
+        .iter()
+        .map(|ds| ds.name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["inner", "relative"]);
+    assert!(group.dataset("dangling").is_err());
+}
+
+#[test]
 fn external_link_resolver() {
     let path = skip_if_missing!("external_links.h5");
     let base_dir = path.parent().unwrap();
