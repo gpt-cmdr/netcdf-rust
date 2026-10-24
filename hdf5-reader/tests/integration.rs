@@ -904,6 +904,153 @@ fn filtered_chunk_size_fields_of_three_and_five_bytes() {
     }
 }
 
+fn gather_expected(name: &str, row: u64, col: u64) -> f64 {
+    if name == "fill" {
+        return if row < 5 { 42.0 } else { -7.0 };
+    }
+    (row * 19 + col) as f64 - 123.0
+}
+
+#[test]
+fn row_column_gathers() {
+    // 17x19 datasets in 5x7 chunks; see generate_fixtures.py (20e).
+    let path = skip_if_missing!("row_column_gather.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let columns = [18, 0, 7, 7, 13];
+    let rows = (2u64, 17u64, 3u64);
+    let selected_rows: Vec<u64> = (rows.0..rows.1).step_by(rows.2 as usize).collect();
+
+    macro_rules! check {
+        ($ty:ty, $name:expr) => {{
+            let name: &str = $name;
+            let ds = file.dataset(name).unwrap();
+            let got = ds
+                .read_rows_columns_chunked::<$ty>(rows, &columns)
+                .unwrap()
+                .expect("2-D chunked dataset");
+            assert_eq!(got.shape(), &[selected_rows.len(), columns.len()], "{name}");
+            for (i, &row) in selected_rows.iter().enumerate() {
+                for (j, &col) in columns.iter().enumerate() {
+                    assert_eq!(
+                        got[[i, j]] as f64,
+                        gather_expected(name, row, col),
+                        "{name} ({row}, {col})"
+                    );
+                }
+            }
+            #[cfg(feature = "rayon")]
+            {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(4)
+                    .build()
+                    .unwrap();
+                let cold = hdf5_reader::Hdf5File::open(&path)
+                    .unwrap()
+                    .dataset(name)
+                    .unwrap();
+                let parallel = cold
+                    .read_rows_columns_chunked_in_pool::<$ty>(rows, &columns, &pool)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(parallel, got, "{name} in pool");
+                let parallel = pool
+                    .install(|| ds.read_rows_columns_chunked_parallel::<$ty>(rows, &columns))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(parallel, got, "{name} parallel");
+            }
+
+            // Out-of-range rows or columns are an error; no columns is an empty result.
+            assert!(ds
+                .read_rows_columns_chunked::<$ty>((0, 18, 1), &columns)
+                .is_err());
+            assert!(ds
+                .read_rows_columns_chunked::<$ty>((0, 17, 1), &[19])
+                .is_err());
+            assert!(ds
+                .read_rows_columns_chunked::<$ty>((0, 17, 1), &[])
+                .unwrap()
+                .unwrap()
+                .is_empty());
+        }};
+    }
+    for suffix in ["plain", "filtered"] {
+        check!(f32, &format!("lef4{suffix}"));
+        check!(f64, &format!("lef8{suffix}"));
+        check!(i32, &format!("bei4{suffix}"));
+    }
+    check!(i32, "fill");
+
+    // Datasets that are not 2-D and chunked are left to the caller.
+    let other = skip_if_missing!("simple_contiguous.h5");
+    let other = hdf5_reader::Hdf5File::open(&other).unwrap();
+    assert!(other
+        .dataset("/data")
+        .unwrap()
+        .read_rows_columns_chunked::<f64>((0, 1, 1), &[0])
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn uncached_reads_leave_the_chunk_cache_untouched() {
+    let path = skip_if_missing!("row_column_gather.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("lef8filtered").unwrap();
+    let data: ndarray::ArrayD<f64> = ds.read_array_uncached().unwrap();
+    for ((row, col), v) in data.indexed_iter().map(|(i, v)| ((i[0], i[1]), *v)) {
+        assert_eq!(v, gather_expected("lef8filtered", row as u64, col as u64));
+    }
+    #[cfg(feature = "rayon")]
+    assert_eq!(ds.read_array_uncached_parallel::<f64>().unwrap(), data);
+    let stats = file.chunk_cache_stats();
+    assert_eq!((stats.inserts, stats.entries), (0, 0), "{stats:?}");
+
+    // A normal read fills the cache, and an uncached read leaves it as it is.
+    assert_eq!(ds.read_array::<f64>().unwrap(), data);
+    let before = file.chunk_cache_stats();
+    assert!(before.entries > 0);
+    assert_eq!(ds.read_array_uncached::<f64>().unwrap(), data);
+    let after = file.chunk_cache_stats();
+    assert_eq!(
+        (after.inserts, after.entries, after.evictions),
+        (before.inserts, before.entries, before.evictions)
+    );
+}
+
+#[test]
+fn zero_byte_chunk_cache_keeps_nothing() {
+    let path = skip_if_missing!("row_column_gather.h5");
+    let file = hdf5_reader::Hdf5File::open_with_options(
+        &path,
+        hdf5_reader::OpenOptions {
+            chunk_cache_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ds = file.dataset("bei4filtered").unwrap();
+    for _ in 0..2 {
+        let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+        assert_eq!(
+            data[[16, 18]] as f64,
+            gather_expected("bei4filtered", 16, 18)
+        );
+    }
+    let stats = file.chunk_cache_stats();
+    assert_eq!(
+        (
+            stats.max_bytes,
+            stats.inserts,
+            stats.entries,
+            stats.in_flight
+        ),
+        (0, 0, 0, 0),
+        "{stats:?}"
+    );
+    assert_eq!(hdf5_reader::DEFAULT_CHUNK_CACHE_BYTES, 64 * 1024 * 1024);
+}
+
 #[test]
 fn btree_v2_chunked() {
     let path = skip_if_missing!("btree_v2_chunked.h5");
