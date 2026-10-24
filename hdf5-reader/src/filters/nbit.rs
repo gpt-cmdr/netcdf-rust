@@ -52,7 +52,11 @@ impl TypeDesc {
                     ));
                 }
                 for i in 0..(*size / base_size) {
-                    base.decode_into(out, offset + i * base_size, bits)?;
+                    let at = i
+                        .checked_mul(base_size)
+                        .and_then(|n| n.checked_add(offset))
+                        .ok_or_else(|| filter_error("nbit array element offset overflowed"))?;
+                    base.decode_into(out, at, bits)?;
                 }
                 Ok(())
             }
@@ -66,7 +70,10 @@ impl TypeDesc {
                             "nbit compound member extends past the record size",
                         ));
                     }
-                    member.decode_into(out, offset + member_offset, bits)?;
+                    let at = offset
+                        .checked_add(*member_offset)
+                        .ok_or_else(|| filter_error("nbit compound member offset overflowed"))?;
+                    member.decode_into(out, at, bits)?;
                 }
                 Ok(())
             }
