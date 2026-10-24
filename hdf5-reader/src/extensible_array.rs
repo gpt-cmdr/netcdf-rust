@@ -12,7 +12,7 @@ use crate::checksum::jenkins_lookup3;
 use crate::chunk_index::ChunkEntry;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageBuffer};
 
 const EAHD_SIGNATURE: [u8; 4] = *b"EAHD";
 const EAIB_SIGNATURE: [u8; 4] = *b"EAIB";
@@ -24,7 +24,7 @@ const EASB_SIGNATURE: [u8; 4] = *b"EASB";
 struct EaHeader {
     client_id: u8,
     element_size: u8,
-    _max_nelmts_bits: u8,
+    max_nelmts_bits: u8,
     idx_blk_elmts: u8,
     data_blk_min_elmts: u8,
     sec_blk_min_data_ptrs: u8,
@@ -93,7 +93,7 @@ fn parse_header(data: &[u8], address: u64, offset_size: u8, length_size: u8) -> 
     Ok(EaHeader {
         client_id,
         element_size,
-        _max_nelmts_bits: max_nelmts_bits,
+        max_nelmts_bits,
         idx_blk_elmts,
         data_blk_min_elmts,
         sec_blk_min_data_ptrs,
@@ -125,28 +125,43 @@ fn parse_header_storage(
     parse_header(bytes.as_ref(), 0, offset_size, length_size)
 }
 
-/// Compute the super block layout.
+/// Compute the super block layout, as libhdf5 does (`H5EA__hdr_init`).
 ///
-/// Returns a vec of (elements_per_data_block, num_data_blocks) for each super block.
-/// Stops generating entries once cumulative capacity exceeds `nelmts`.
-fn compute_super_block_layout(header: &EaHeader) -> Vec<(u64, u64)> {
-    let mut layout = Vec::new();
-    let dblk_min = header.data_blk_min_elmts as u64;
-    let sblk_min = header.sec_blk_min_data_ptrs as u64;
-    let nelmts = header._nelmts;
-    let mut cumulative = header.idx_blk_elmts as u64;
-
-    for sb_idx in 0u32..64 {
-        if cumulative >= nelmts {
-            break;
-        }
-        let elmts_per_dblk = dblk_min * (1u64 << (sb_idx / 2));
-        let num_dblks = sblk_min * (1u64 << (sb_idx.div_ceil(2)));
-        layout.push((elmts_per_dblk, num_dblks));
-        cumulative += elmts_per_dblk * num_dblks;
+/// Returns (elements_per_data_block, num_data_blocks) for each of the
+/// `1 + max_nelmts_bits - log2(data_blk_min_elmts)` super blocks: super block
+/// `u` holds `2^(u/2)` data blocks of `2^((u+1)/2) * data_blk_min_elmts`
+/// elements each.
+fn compute_super_block_layout(header: &EaHeader) -> Result<Vec<(u64, u64)>> {
+    let invalid = || Error::InvalidData("invalid extensible array creation parameters".into());
+    if !header.data_blk_min_elmts.is_power_of_two()
+        || !header.sec_blk_min_data_ptrs.is_power_of_two()
+        || header.max_nelmts_bits > 64
+    {
+        return Err(invalid());
     }
+    let nsblks = u32::from(header.max_nelmts_bits)
+        .checked_sub(header.data_blk_min_elmts.trailing_zeros())
+        .ok_or_else(invalid)?
+        + 1;
 
-    layout
+    Ok((0..nsblks)
+        .map(|sb_idx| {
+            (
+                u64::from(header.data_blk_min_elmts) << sb_idx.div_ceil(2),
+                1u64 << (sb_idx / 2),
+            )
+        })
+        .collect())
+}
+
+/// The number of super blocks whose data blocks the index block points to
+/// directly, and the number of those data blocks (`H5EA__iblock_alloc`).
+fn index_block_direct_blocks(header: &EaHeader, sb_layout: &[(u64, u64)]) -> (usize, usize) {
+    // `sec_blk_min_data_ptrs` is a power of two (checked by
+    // `compute_super_block_layout`).
+    let min_ptrs = header.sec_blk_min_data_ptrs;
+    let super_blocks = (2 * min_ptrs.trailing_zeros() as usize).min(sb_layout.len());
+    (super_blocks, 2 * (usize::from(min_ptrs) - 1))
 }
 
 fn checked_add_usize(left: usize, right: usize, context: &str) -> Result<usize> {
@@ -203,17 +218,13 @@ fn index_block_len(header: &EaHeader, sb_layout: &[(u64, u64)], offset_size: u8)
         usize::from(header.element_size),
         "extensible array index block inline entry bytes",
     )?;
-    let direct_ptrs = checked_mul_usize(
-        2,
-        usize::from(header.sec_blk_min_data_ptrs),
-        "extensible array index block direct data block pointer count",
-    )?;
+    let (direct_sblks, direct_ptrs) = index_block_direct_blocks(header, sb_layout);
     let direct_bytes = checked_mul_usize(
         direct_ptrs,
         offset_size,
         "extensible array index block direct data block address bytes",
     )?;
-    let secondary_ptrs = sb_layout.len().saturating_sub(direct_ptrs);
+    let secondary_ptrs = sb_layout.len() - direct_sblks;
     let secondary_bytes = checked_mul_usize(
         secondary_ptrs,
         offset_size,
@@ -235,33 +246,41 @@ fn index_block_len(header: &EaHeader, sb_layout: &[(u64, u64)], offset_size: u8)
     Ok(len)
 }
 
-fn secondary_page_bitmap_bytes(
-    max_page_bits: u8,
-    elmts_per_dblk: u64,
-    num_dblks: u64,
-) -> Result<usize> {
-    let page_nelmts = ea_page_nelmts(max_page_bits)?;
+/// Pages per data block of `elmts_per_dblk` elements, or 0 if such data
+/// blocks are not paged (they fit in one page).
+fn data_block_pages(page_nelmts: usize, elmts_per_dblk: u64) -> Result<usize> {
     if page_nelmts == 0 {
         return Ok(0);
     }
-
     let elmts_per_dblk =
         checked_usize_from_u64(elmts_per_dblk, "extensible array data block element count")?;
     if elmts_per_dblk <= page_nelmts {
         return Ok(0);
     }
+    Ok(elmts_per_dblk.div_ceil(page_nelmts))
+}
 
+/// Size of a secondary block's page bitmap. libhdf5 reserves
+/// `ceil(pages_per_dblk / 8)` bytes per data block, but numbers the bits
+/// continuously: page `p` of data block `d` is bit `d * pages_per_dblk + p`.
+fn secondary_page_bitmap_bytes(pages_per_dblk: usize, num_dblks: u64) -> Result<usize> {
     let num_dblks = checked_usize_from_u64(
         num_dblks,
         "extensible array secondary block data block count",
     )?;
-    let pages_per_dblk = elmts_per_dblk.div_ceil(page_nelmts);
-    let total_pages = checked_mul_usize(
+    checked_mul_usize(
         num_dblks,
-        pages_per_dblk,
-        "extensible array secondary block page bitmap bit count",
-    )?;
-    Ok(total_pages.div_ceil(8))
+        pages_per_dblk.div_ceil(8),
+        "extensible array secondary block page bitmap bytes",
+    )
+}
+
+/// Whether bit `bit` of a page bitmap is set. libhdf5 numbers the bits from
+/// the most significant bit of each byte (`H5VM_bit_get`).
+fn page_initialized(page_init: &[u8], bit: usize) -> bool {
+    page_init
+        .get(bit / 8)
+        .is_some_and(|byte| byte & (0x80 >> (bit % 8)) != 0)
 }
 
 fn secondary_block_len(
@@ -284,81 +303,31 @@ fn secondary_block_len(
     Ok(len)
 }
 
-fn data_block_len_from_bitmap(
-    num_entries: usize,
-    page_nelmts: usize,
-    entry_size: u8,
-    offset_size: u8,
-    sizeof_nelmts: usize,
-    page_bitmap: &[u8],
-) -> Result<usize> {
-    let num_pages = num_entries.div_ceil(page_nelmts);
-    let bitmap_bytes = num_pages.div_ceil(8);
-    let mut len = checked_add_usize(
-        ea_block_header_len(offset_size, sizeof_nelmts)?,
-        bitmap_bytes,
-        "extensible array data block length",
-    )?;
-
-    for page_idx in 0..num_pages {
-        let byte_idx = page_idx / 8;
-        let bit_idx = page_idx % 8;
-        let page_initialized =
-            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
-        if !page_initialized {
-            continue;
-        }
-
-        let entries_in_page = if page_idx == num_pages - 1 {
-            let remainder = num_entries % page_nelmts;
-            if remainder == 0 {
-                page_nelmts
-            } else {
-                remainder
-            }
-        } else {
-            page_nelmts
-        };
-        let entry_bytes = checked_mul_usize(
-            entries_in_page,
-            usize::from(entry_size),
-            "extensible array data block page entry bytes",
-        )?;
-        let page_bytes = checked_add_usize(
-            entry_bytes,
-            4,
-            "extensible array data block page byte length",
-        )?;
-        len = checked_add_usize(len, page_bytes, "extensible array data block length")?;
-    }
-
-    Ok(len)
-}
-
-fn unpaged_data_block_len(
-    num_entries: usize,
-    offset_size: u8,
-    entry_size: u8,
-    sizeof_nelmts: usize,
-) -> Result<usize> {
-    let entry_bytes = checked_mul_usize(
-        num_entries,
-        usize::from(entry_size),
-        "extensible array data block entry bytes",
-    )?;
-    let len = checked_add_usize(
-        ea_block_header_len(offset_size, sizeof_nelmts)?,
-        entry_bytes,
-        "extensible array data block length",
-    )?;
-    checked_add_usize(len, 4, "extensible array data block length")
-}
-
 /// A single raw entry.
 struct EaRawEntry {
     address: u64,
     chunk_size: u64,
     filter_mask: u32,
+}
+
+/// Fields shared by every block of one array.
+struct EaParams {
+    is_filtered: bool,
+    offset_size: u8,
+    entry_size: u8,
+    /// `ceil(max_nelmts_bits / 8)`, the width of the blocks' offset field.
+    sizeof_nelmts: usize,
+    /// Entries per data block page (0: data blocks are never paged).
+    page_nelmts: usize,
+}
+
+/// A data block to read entries from.
+struct DataBlockRef<'a> {
+    address: u64,
+    num_entries: u64,
+    /// For data blocks reached through a secondary block: its page bitmap and
+    /// the bit of this data block's first page.
+    page_init: Option<(&'a [u8], usize)>,
 }
 
 /// Read `count` entries from the cursor.
@@ -393,34 +362,63 @@ fn read_entries(
     Ok(entries)
 }
 
-/// Parse a data block and return its entries.
-///
-/// `sizeof_nelmts` is `ceil(max_nelmts_bits / 8)` — used for the block_off field.
-#[allow(clippy::too_many_arguments)]
-fn parse_data_block(
-    data: &[u8],
-    address: u64,
-    num_entries: usize,
-    is_filtered: bool,
-    max_page_bits: u8,
-    offset_size: u8,
-    entry_size: u8,
-    sizeof_nelmts: usize,
+/// Read `count` entries at `position`.
+fn read_entries_at_storage(
+    storage: &dyn Storage,
+    position: u64,
+    count: usize,
+    params: &EaParams,
 ) -> Result<Vec<EaRawEntry>> {
-    let mut cursor = Cursor::new(data);
-    cursor.set_position(address);
+    let len = checked_mul_usize(
+        count,
+        usize::from(params.entry_size),
+        "extensible array entry bytes",
+    )?;
+    let bytes = storage.read_range(position, len)?;
+    let mut cursor = Cursor::new(bytes.as_ref());
+    read_entries(
+        &mut cursor,
+        count,
+        params.is_filtered,
+        params.offset_size,
+        params.entry_size,
+    )
+}
+
+/// A parsed index block.
+struct IndexBlock {
+    /// Entries stored in the index block itself.
+    inline: Vec<EaRawEntry>,
+    /// Data block addresses of the first super blocks.
+    dblk_addrs: Vec<u64>,
+    /// Secondary block addresses of the remaining super blocks.
+    sblk_addrs: Vec<u64>,
+}
+
+fn read_index_block_storage(
+    storage: &dyn Storage,
+    header: &EaHeader,
+    sb_layout: &[(u64, u64)],
+    params: &EaParams,
+) -> Result<IndexBlock> {
+    let offset_size = params.offset_size;
+    let data = storage.read_range(
+        header.index_block_address,
+        index_block_len(header, sb_layout, offset_size)?,
+    )?;
+    let mut cursor = Cursor::new(data.as_ref());
 
     let sig = cursor.read_bytes(4)?;
-    if sig != EADB_SIGNATURE {
+    if sig != EAIB_SIGNATURE {
         return Err(Error::InvalidExtensibleArraySignature {
-            context: "data block signature mismatch",
+            context: "index block signature mismatch",
         });
     }
 
     let version = cursor.read_u8()?;
     if version != 0 {
         return Err(Error::Other(format!(
-            "unsupported extensible array data block version {}",
+            "unsupported extensible array index block version {}",
             version
         )));
     }
@@ -428,72 +426,41 @@ fn parse_data_block(
     let _client_id = cursor.read_u8()?;
     let _header_address = cursor.read_offset(offset_size)?;
 
-    // Block offset: sizeof_nelmts bytes indicating this block's element index offset.
-    cursor.skip(sizeof_nelmts)?;
+    let inline = read_entries(
+        &mut cursor,
+        usize::from(header.idx_blk_elmts),
+        params.is_filtered,
+        offset_size,
+        header.element_size,
+    )?;
 
-    // Paging is used only when nelmts exceeds 2^page_bits.
-    let page_nelmts = ea_page_nelmts(max_page_bits)?;
-
-    if page_nelmts > 0 && num_entries > page_nelmts {
-        // Paged data block
-        let num_pages = num_entries.div_ceil(page_nelmts);
-        let bitmap_bytes = num_pages.div_ceil(8);
-        let page_bitmap = cursor.read_bytes(bitmap_bytes)?.to_vec();
-
-        let mut all_entries = Vec::with_capacity(num_entries);
-        for page_idx in 0..num_pages {
-            let byte_idx = page_idx / 8;
-            let bit_idx = page_idx % 8;
-            let page_initialized =
-                byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
-
-            let entries_in_page = if page_idx == num_pages - 1 {
-                let remainder = num_entries % page_nelmts;
-                if remainder == 0 {
-                    page_nelmts
-                } else {
-                    remainder
-                }
-            } else {
-                page_nelmts
-            };
-
-            if page_initialized {
-                let page_entries = read_entries(
-                    &mut cursor,
-                    entries_in_page,
-                    is_filtered,
-                    offset_size,
-                    entry_size,
-                )?;
-                let _page_checksum = cursor.read_u32_le()?;
-                all_entries.extend(page_entries);
-            } else {
-                for _ in 0..entries_in_page {
-                    all_entries.push(EaRawEntry {
-                        address: u64::MAX,
-                        chunk_size: 0,
-                        filter_mask: 0,
-                    });
-                }
-            }
-        }
-        Ok(all_entries)
-    } else {
-        // Non-paged data block
-        let entries = read_entries(
-            &mut cursor,
-            num_entries,
-            is_filtered,
-            offset_size,
-            entry_size,
-        )?;
-        let _checksum = cursor.read_u32_le()?;
-        Ok(entries)
+    let (direct_sblks, ndblk_addrs) = index_block_direct_blocks(header, sb_layout);
+    let mut dblk_addrs = Vec::with_capacity(ndblk_addrs);
+    for _ in 0..ndblk_addrs {
+        dblk_addrs.push(cursor.read_offset(offset_size)?);
     }
+
+    let nsblk_addrs = sb_layout.len() - direct_sblks;
+    let mut sblk_addrs = Vec::with_capacity(nsblk_addrs);
+    for _ in 0..nsblk_addrs {
+        sblk_addrs.push(cursor.read_offset(offset_size)?);
+    }
+
+    Ok(IndexBlock {
+        inline,
+        dblk_addrs,
+        sblk_addrs,
+    })
 }
 
-/// Parse a secondary block and return its data block addresses.
+/// A parsed secondary block.
+struct SecondaryBlock {
+    dblk_addrs: Vec<u64>,
+    /// Page bitmap of paged data blocks (see `secondary_page_bitmap_bytes`).
+    page_init: Vec<u8>,
+}
+
+/// Parse a secondary block.
 fn parse_secondary_block(
     data: &[u8],
     address: u64,
@@ -501,7 +468,7 @@ fn parse_secondary_block(
     offset_size: u8,
     sizeof_nelmts: usize,
     page_bitmap_bytes: usize,
-) -> Result<Vec<u64>> {
+) -> Result<SecondaryBlock> {
     let mut cursor = Cursor::new(data);
     cursor.set_position(address);
 
@@ -524,33 +491,43 @@ fn parse_secondary_block(
     let _header_address = cursor.read_offset(offset_size)?;
     cursor.skip(sizeof_nelmts)?;
 
-    if page_bitmap_bytes > 0 {
-        cursor.skip(page_bitmap_bytes)?;
-    }
+    // Per HDF5 spec III.H "Extensible Array Secondary Block", the secondary
+    // block holds the page initialization bitmap when data blocks are paged.
+    let page_init = cursor.read_bytes(page_bitmap_bytes)?.to_vec();
 
-    let mut addrs = Vec::with_capacity(num_dblk_addrs);
+    let mut dblk_addrs = Vec::with_capacity(num_dblk_addrs);
     for _ in 0..num_dblk_addrs {
-        addrs.push(cursor.read_offset(offset_size)?);
+        dblk_addrs.push(cursor.read_offset(offset_size)?);
     }
 
     // Skip checksum
     let _checksum = cursor.read_u32_le()?;
 
-    Ok(addrs)
+    Ok(SecondaryBlock {
+        dblk_addrs,
+        page_init,
+    })
 }
 
 fn parse_secondary_block_storage(
     storage: &dyn Storage,
     address: u64,
-    num_dblk_addrs: usize,
-    offset_size: u8,
-    sizeof_nelmts: usize,
-    page_bitmap_bytes: usize,
-) -> Result<Vec<u64>> {
+    elmts_per_dblk: u64,
+    num_dblks: u64,
+    params: &EaParams,
+) -> Result<SecondaryBlock> {
+    let num_dblk_addrs = checked_usize_from_u64(
+        num_dblks,
+        "extensible array secondary block data block count",
+    )?;
+    let page_bitmap_bytes = secondary_page_bitmap_bytes(
+        data_block_pages(params.page_nelmts, elmts_per_dblk)?,
+        num_dblks,
+    )?;
     let read_len = secondary_block_len(
         num_dblk_addrs,
-        offset_size,
-        sizeof_nelmts,
+        params.offset_size,
+        params.sizeof_nelmts,
         page_bitmap_bytes,
     )?;
     let bytes = storage.read_range(address, read_len)?;
@@ -558,40 +535,166 @@ fn parse_secondary_block_storage(
         bytes.as_ref(),
         0,
         num_dblk_addrs,
-        offset_size,
-        sizeof_nelmts,
+        params.offset_size,
+        params.sizeof_nelmts,
         page_bitmap_bytes,
     )
 }
 
-fn read_entry_at(
-    data: &[u8],
-    position: u64,
-    is_filtered: bool,
-    offset_size: u8,
-    entry_size: u8,
-) -> Result<EaRawEntry> {
-    let mut cursor = Cursor::new(data);
-    cursor.set_position(position);
-    let mut entries = read_entries(&mut cursor, 1, is_filtered, offset_size, entry_size)?;
-    entries
-        .pop()
-        .ok_or_else(|| Error::InvalidData("missing extensible array entry".into()))
+/// Check a data block's signature and version; returns the length of its
+/// prefix (signature, version, client ID, header address and block offset).
+fn check_data_block_prefix_storage(
+    storage: &dyn Storage,
+    address: u64,
+    params: &EaParams,
+) -> Result<usize> {
+    let prefix_len = ea_block_header_len(params.offset_size, params.sizeof_nelmts)?;
+    let prefix = storage.read_range(address, prefix_len)?;
+    let mut cursor = Cursor::new(prefix.as_ref());
+
+    let sig = cursor.read_bytes(4)?;
+    if sig != EADB_SIGNATURE {
+        return Err(Error::InvalidExtensibleArraySignature {
+            context: "data block signature mismatch",
+        });
+    }
+
+    let version = cursor.read_u8()?;
+    if version != 0 {
+        return Err(Error::Other(format!(
+            "unsupported extensible array data block version {}",
+            version
+        )));
+    }
+
+    Ok(prefix_len)
 }
 
-fn read_entry_at_storage(
+/// File position of the first entry of page `page_idx` of a paged data block.
+///
+/// A data block of more than one page is its prefix and the prefix checksum,
+/// followed by every page at a fixed stride (page entries and a checksum),
+/// whether or not the page was ever written (`H5EA__lookup_elmt`).
+fn data_block_page_position(
+    address: u64,
+    prefix_len: usize,
+    page_idx: usize,
+    params: &EaParams,
+) -> Result<u64> {
+    let page_bytes = checked_mul_usize(
+        params.page_nelmts,
+        usize::from(params.entry_size),
+        "extensible array data block page entry bytes",
+    )?;
+    let page_size = checked_add_usize(page_bytes, 4, "extensible array data block page size")?;
+    let pages_offset = checked_mul_usize(
+        page_idx,
+        page_size,
+        "extensible array data block page offset",
+    )?;
+    let offset = checked_add_usize(prefix_len, 4, "extensible array data block page offset")?;
+    let offset = checked_add_usize(
+        offset,
+        pages_offset,
+        "extensible array data block page offset",
+    )?;
+    checked_add_u64(
+        address,
+        checked_u64_from_usize(offset, "extensible array data block page offset")?,
+        "extensible array data block page position",
+    )
+}
+
+/// Whether page `page_idx` of a paged data block was ever written.
+fn data_block_page_initialized(block: &DataBlockRef<'_>, page_idx: usize) -> Result<bool> {
+    let Some((page_init, first_bit)) = block.page_init else {
+        return Err(Error::InvalidData(
+            "paged extensible array data block outside a secondary block".into(),
+        ));
+    };
+    let bit = checked_add_usize(first_bit, page_idx, "extensible array page bitmap index")?;
+    Ok(page_initialized(page_init, bit))
+}
+
+/// Read entry `local_idx` of a data block, or `None` if it lies in a page that
+/// was never written.
+fn read_data_block_entry_storage(
     storage: &dyn Storage,
-    position: u64,
-    is_filtered: bool,
-    offset_size: u8,
-    entry_size: u8,
-) -> Result<EaRawEntry> {
-    let bytes = storage.read_range(position, usize::from(entry_size))?;
-    let mut cursor = Cursor::new(bytes.as_ref());
-    let mut entries = read_entries(&mut cursor, 1, is_filtered, offset_size, entry_size)?;
-    entries
-        .pop()
-        .ok_or_else(|| Error::InvalidData("missing extensible array entry".into()))
+    block: &DataBlockRef<'_>,
+    local_idx: usize,
+    params: &EaParams,
+) -> Result<Option<EaRawEntry>> {
+    let prefix_len = check_data_block_prefix_storage(storage, block.address, params)?;
+    let entry_size = usize::from(params.entry_size);
+
+    let position = if data_block_pages(params.page_nelmts, block.num_entries)? == 0 {
+        let offset = checked_mul_usize(local_idx, entry_size, "EA entry offset")?;
+        let offset = checked_add_usize(prefix_len, offset, "EA entry offset")?;
+        checked_add_u64(
+            block.address,
+            checked_u64_from_usize(offset, "EA entry offset")?,
+            "EA entry position",
+        )?
+    } else {
+        let page_idx = local_idx / params.page_nelmts;
+        if !data_block_page_initialized(block, page_idx)? {
+            return Ok(None);
+        }
+        let within_page = checked_mul_usize(
+            local_idx % params.page_nelmts,
+            entry_size,
+            "EA page entry offset",
+        )?;
+        checked_add_u64(
+            data_block_page_position(block.address, prefix_len, page_idx, params)?,
+            checked_u64_from_usize(within_page, "EA page entry offset")?,
+            "EA page entry position",
+        )?
+    };
+
+    Ok(read_entries_at_storage(storage, position, 1, params)?.pop())
+}
+
+/// Read entries `0..count` of a data block, each with its index in the block.
+/// Entries in pages that were never written are left out.
+fn read_data_block_storage(
+    storage: &dyn Storage,
+    block: &DataBlockRef<'_>,
+    count: usize,
+    params: &EaParams,
+) -> Result<Vec<(usize, EaRawEntry)>> {
+    let prefix_len = check_data_block_prefix_storage(storage, block.address, params)?;
+
+    if data_block_pages(params.page_nelmts, block.num_entries)? == 0 {
+        let position = checked_add_u64(
+            block.address,
+            checked_u64_from_usize(prefix_len, "EA data block prefix length")?,
+            "EA data block entry position",
+        )?;
+        let entries = read_entries_at_storage(storage, position, count, params)?;
+        return Ok(entries.into_iter().enumerate().collect());
+    }
+
+    let mut entries = Vec::new();
+    for page_idx in 0..count.div_ceil(params.page_nelmts) {
+        if !data_block_page_initialized(block, page_idx)? {
+            continue;
+        }
+        let first = page_idx * params.page_nelmts;
+        let page_entries = read_entries_at_storage(
+            storage,
+            data_block_page_position(block.address, prefix_len, page_idx, params)?,
+            params.page_nelmts.min(count - first),
+            params,
+        )?;
+        entries.extend(
+            page_entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, entry)| (first + i, entry)),
+        );
+    }
+    Ok(entries)
 }
 
 fn linear_target_offsets(
@@ -653,324 +756,36 @@ fn linear_target_offsets(
     targets
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_data_block_entry(
-    data: &[u8],
-    address: u64,
-    num_entries: usize,
-    local_idx: usize,
-    is_filtered: bool,
-    max_page_bits: u8,
-    offset_size: u8,
-    entry_size: u8,
-    sizeof_nelmts: usize,
-) -> Result<EaRawEntry> {
-    let mut cursor = Cursor::new(data);
-    cursor.set_position(address);
-
-    let sig = cursor.read_bytes(4)?;
-    if sig != EADB_SIGNATURE {
-        return Err(Error::InvalidExtensibleArraySignature {
-            context: "data block signature mismatch",
-        });
-    }
-
-    let version = cursor.read_u8()?;
-    if version != 0 {
-        return Err(Error::Other(format!(
-            "unsupported extensible array data block version {}",
-            version
-        )));
-    }
-
-    let _client_id = cursor.read_u8()?;
-    let _header_address = cursor.read_offset(offset_size)?;
-    cursor.skip(sizeof_nelmts)?;
-
-    let page_nelmts = ea_page_nelmts(max_page_bits)?;
-
-    if page_nelmts > 0 && num_entries > page_nelmts {
-        let num_pages = num_entries.div_ceil(page_nelmts);
-        let bitmap_bytes = num_pages.div_ceil(8);
-        let page_bitmap = cursor.read_bytes(bitmap_bytes)?.to_vec();
-        let data_start = cursor.position();
-
-        let target_page = local_idx / page_nelmts;
-        let within_page = local_idx % page_nelmts;
-        let byte_idx = target_page / 8;
-        let bit_idx = target_page % 8;
-        let page_initialized =
-            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
-        if !page_initialized {
-            return Ok(EaRawEntry {
-                address: u64::MAX,
-                chunk_size: 0,
-                filter_mask: 0,
-            });
-        }
-
-        let mut page_start = data_start;
-        for page_idx in 0..target_page {
-            let entries_in_page = if page_idx == num_pages - 1 {
-                let remainder = num_entries % page_nelmts;
-                if remainder == 0 {
-                    page_nelmts
-                } else {
-                    remainder
-                }
-            } else {
-                page_nelmts
-            };
-            let page_byte_idx = page_idx / 8;
-            let page_bit_idx = page_idx % 8;
-            let initialized = page_byte_idx < page_bitmap.len()
-                && (page_bitmap[page_byte_idx] & (1 << page_bit_idx)) != 0;
-            if initialized {
-                page_start += (entries_in_page * entry_size as usize + 4) as u64;
-            }
-        }
-
-        let position = page_start + (within_page * entry_size as usize) as u64;
-        return read_entry_at(data, position, is_filtered, offset_size, entry_size);
-    }
-
-    let position = cursor.position() + (local_idx * entry_size as usize) as u64;
-    read_entry_at(data, position, is_filtered, offset_size, entry_size)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn read_data_block_entry_storage(
+/// Look up the entries of the chunks in `chunk_bounds`.
+fn collect_extensible_array_chunk_entries_bounded_storage(
     storage: &dyn Storage,
-    address: u64,
-    num_entries: usize,
-    local_idx: usize,
-    is_filtered: bool,
-    max_page_bits: u8,
-    offset_size: u8,
-    entry_size: u8,
-    sizeof_nelmts: usize,
-) -> Result<EaRawEntry> {
-    let header_len = 4 + 1 + 1 + usize::from(offset_size) + sizeof_nelmts;
-    let header = storage.read_range(address, header_len)?;
-    let mut cursor = Cursor::new(header.as_ref());
-
-    let sig = cursor.read_bytes(4)?;
-    if sig != EADB_SIGNATURE {
-        return Err(Error::InvalidExtensibleArraySignature {
-            context: "data block signature mismatch",
-        });
-    }
-
-    let version = cursor.read_u8()?;
-    if version != 0 {
-        return Err(Error::Other(format!(
-            "unsupported extensible array data block version {}",
-            version
-        )));
-    }
-
-    let _client_id = cursor.read_u8()?;
-    let _header_address = cursor.read_offset(offset_size)?;
-    cursor.skip(sizeof_nelmts)?;
-
-    let base = checked_add_u64(
-        address,
-        checked_u64_from_usize(header_len, "EA data block header length")?,
-        "EA data block entry base",
-    )?;
-    let page_nelmts = ea_page_nelmts(max_page_bits)?;
-
-    if page_nelmts > 0 && num_entries > page_nelmts {
-        let num_pages = num_entries.div_ceil(page_nelmts);
-        let bitmap_bytes = num_pages.div_ceil(8);
-        let page_bitmap = storage.read_range(base, bitmap_bytes)?;
-        let data_start = checked_add_u64(
-            base,
-            checked_u64_from_usize(bitmap_bytes, "EA bitmap size")?,
-            "EA data block page data start",
-        )?;
-
-        let target_page = local_idx / page_nelmts;
-        let within_page = local_idx % page_nelmts;
-        let byte_idx = target_page / 8;
-        let bit_idx = target_page % 8;
-        let page_initialized =
-            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
-        if !page_initialized {
-            return Ok(EaRawEntry {
-                address: u64::MAX,
-                chunk_size: 0,
-                filter_mask: 0,
-            });
-        }
-
-        let mut page_start = data_start;
-        for page_idx in 0..target_page {
-            let entries_in_page = if page_idx == num_pages - 1 {
-                let remainder = num_entries % page_nelmts;
-                if remainder == 0 {
-                    page_nelmts
-                } else {
-                    remainder
-                }
-            } else {
-                page_nelmts
-            };
-            let page_byte_idx = page_idx / 8;
-            let page_bit_idx = page_idx % 8;
-            let initialized = page_byte_idx < page_bitmap.len()
-                && (page_bitmap[page_byte_idx] & (1 << page_bit_idx)) != 0;
-            if initialized {
-                let entry_bytes = checked_mul_usize(
-                    entries_in_page,
-                    usize::from(entry_size),
-                    "EA page entry bytes",
-                )?;
-                let page_size = checked_add_usize(entry_bytes, 4, "EA page size")?;
-                page_start = checked_add_u64(
-                    page_start,
-                    checked_u64_from_usize(page_size, "EA page size")?,
-                    "EA page start",
-                )?;
-            }
-        }
-
-        let within_page_offset =
-            checked_mul_usize(within_page, usize::from(entry_size), "EA page entry offset")?;
-        let position = checked_add_u64(
-            page_start,
-            checked_u64_from_usize(within_page_offset, "EA page entry offset")?,
-            "EA page entry position",
-        )?;
-        return read_entry_at_storage(storage, position, is_filtered, offset_size, entry_size);
-    }
-
-    let local_offset = checked_mul_usize(local_idx, usize::from(entry_size), "EA entry offset")?;
-    let position = checked_add_u64(
-        base,
-        checked_u64_from_usize(local_offset, "EA entry offset")?,
-        "EA entry position",
-    )?;
-    read_entry_at_storage(storage, position, is_filtered, offset_size, entry_size)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn read_data_block_storage(
-    storage: &dyn Storage,
-    address: u64,
-    num_entries: usize,
-    is_filtered: bool,
-    max_page_bits: u8,
-    offset_size: u8,
-    entry_size: u8,
-    sizeof_nelmts: usize,
-) -> Result<Vec<EaRawEntry>> {
-    let page_nelmts = ea_page_nelmts(max_page_bits)?;
-    let read_len = if page_nelmts > 0 && num_entries > page_nelmts {
-        let header_len = ea_block_header_len(offset_size, sizeof_nelmts)?;
-        let num_pages = num_entries.div_ceil(page_nelmts);
-        let bitmap_bytes = num_pages.div_ceil(8);
-        let bitmap_end = checked_add_usize(
-            header_len,
-            bitmap_bytes,
-            "extensible array data block bitmap range",
-        )?;
-        let prefix = storage.read_range(address, bitmap_end)?;
-        let page_bitmap = &prefix.as_ref()[header_len..bitmap_end];
-        data_block_len_from_bitmap(
-            num_entries,
-            page_nelmts,
-            entry_size,
-            offset_size,
-            sizeof_nelmts,
-            page_bitmap,
-        )?
-    } else {
-        unpaged_data_block_len(num_entries, offset_size, entry_size, sizeof_nelmts)?
-    };
-
-    let block = storage.read_range(address, read_len)?;
-    parse_data_block(
-        block.as_ref(),
-        0,
-        num_entries,
-        is_filtered,
-        max_page_bits,
-        offset_size,
-        entry_size,
-        sizeof_nelmts,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_extensible_array_chunk_entries_bounded(
-    data: &[u8],
     header: &EaHeader,
-    offset_size: u8,
+    sb_layout: &[(u64, u64)],
+    params: &EaParams,
     dataset_shape: &[u64],
     chunk_dims: &[u32],
     chunk_bounds: (&[u64], &[u64]),
-    sb_layout: &[(u64, u64)],
-    sizeof_nelmts: usize,
 ) -> Result<Vec<ChunkEntry>> {
-    let is_filtered = header.client_id == 1;
+    let offset_size = params.offset_size;
     let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(chunk_bounds));
+    let index = read_index_block_storage(storage, header, sb_layout, params)?;
+    let (direct_sblks, _) = index_block_direct_blocks(header, sb_layout);
 
-    let mut cursor = Cursor::new(data);
-    cursor.set_position(header.index_block_address);
-
-    let sig = cursor.read_bytes(4)?;
-    if sig != EAIB_SIGNATURE {
-        return Err(Error::InvalidExtensibleArraySignature {
-            context: "index block signature mismatch",
-        });
-    }
-
-    let version = cursor.read_u8()?;
-    if version != 0 {
-        return Err(Error::Other(format!(
-            "unsupported extensible array index block version {}",
-            version
-        )));
-    }
-
-    let _client_id = cursor.read_u8()?;
-    let _header_address = cursor.read_offset(offset_size)?;
-
-    let num_inline = header.idx_blk_elmts as usize;
-    let inline_start = cursor.position();
-    cursor.skip(num_inline * header.element_size as usize)?;
-
-    let ndblk_addrs = 2 * header.sec_blk_min_data_ptrs as usize;
-    let mut direct_dblk_addrs = Vec::with_capacity(ndblk_addrs);
-    for _ in 0..ndblk_addrs {
-        direct_dblk_addrs.push(cursor.read_offset(offset_size)?);
-    }
-
-    let nsblks = sb_layout.len();
-    let nsblk_addrs = nsblks.saturating_sub(ndblk_addrs);
-    let mut sec_block_addrs = Vec::with_capacity(nsblk_addrs);
-    for _ in 0..nsblk_addrs {
-        sec_block_addrs.push(cursor.read_offset(offset_size)?);
-    }
-
-    let mut secondary_block_cache: Vec<Option<Vec<u64>>> = vec![None; sec_block_addrs.len()];
+    let mut secondary_block_cache: Vec<Option<SecondaryBlock>> =
+        (0..index.sblk_addrs.len()).map(|_| None).collect();
     let mut entries = Vec::new();
 
     for (linear_idx, offsets) in targets {
-        let raw = if linear_idx < num_inline {
-            read_entry_at(
-                data,
-                inline_start + (linear_idx * header.element_size as usize) as u64,
-                is_filtered,
-                offset_size,
-                header.element_size,
-            )?
+        let looked_up;
+        let raw = if let Some(raw) = index.inline.get(linear_idx) {
+            raw
         } else {
-            let mut relative_idx = (linear_idx - num_inline) as u64;
+            // Element index past the index block's own entries.
+            let mut relative_idx = checked_u64_from_usize(linear_idx, "EA element index")?
+                - u64::from(header.idx_blk_elmts);
             let mut sb_idx = None;
             for (candidate_idx, (elmts_per_dblk, num_dblks)) in sb_layout.iter().enumerate() {
-                let capacity = elmts_per_dblk * num_dblks;
+                let capacity = elmts_per_dblk.saturating_mul(*num_dblks);
                 if relative_idx < capacity {
                     sb_idx = Some(candidate_idx);
                     break;
@@ -981,68 +796,87 @@ fn collect_extensible_array_chunk_entries_bounded(
             let Some(sb_idx) = sb_idx else {
                 continue;
             };
-            let (elmts_per_dblk, _) = sb_layout[sb_idx];
-            let dblk_idx = (relative_idx / elmts_per_dblk) as usize;
-            let local_idx = (relative_idx % elmts_per_dblk) as usize;
+            let (elmts_per_dblk, num_dblks) = sb_layout[sb_idx];
+            let dblk_idx = checked_usize_from_u64(
+                relative_idx / elmts_per_dblk,
+                "extensible array data block index",
+            )?;
+            let local_idx = checked_usize_from_u64(
+                relative_idx % elmts_per_dblk,
+                "extensible array data block element index",
+            )?;
 
-            let dblk_addr = if sb_idx < 2 {
+            let (dblk_addr, page_init) = if sb_idx < direct_sblks {
+                // Super blocks before `sb_idx` are direct too, with few data blocks.
                 let base = sb_layout[..sb_idx]
                     .iter()
                     .map(|(_, num_dblks)| *num_dblks as usize)
                     .sum::<usize>();
-                *direct_dblk_addrs.get(base + dblk_idx).unwrap_or(&u64::MAX)
+                let dblk_addr = index
+                    .dblk_addrs
+                    .get(base + dblk_idx)
+                    .copied()
+                    .unwrap_or(u64::MAX);
+                (dblk_addr, None)
             } else {
-                let sec_cache_idx = sb_idx - 2;
+                let sec_cache_idx = sb_idx - direct_sblks;
                 if secondary_block_cache[sec_cache_idx].is_none() {
-                    let sec_addr = sec_block_addrs
+                    let sec_addr = index
+                        .sblk_addrs
                         .get(sec_cache_idx)
                         .copied()
                         .unwrap_or(u64::MAX);
-                    if Cursor::is_undefined_offset(sec_addr, offset_size) {
-                        secondary_block_cache[sec_cache_idx] = Some(Vec::new());
-                    } else {
-                        let (_, num_dblks) = sb_layout[sb_idx];
-                        let page_bitmap_bytes = secondary_page_bitmap_bytes(
-                            header.max_dblk_page_nelmts_bits,
-                            elmts_per_dblk,
-                            num_dblks,
-                        )?;
-                        secondary_block_cache[sec_cache_idx] = Some(parse_secondary_block(
-                            data,
-                            sec_addr,
-                            checked_usize_from_u64(
+                    secondary_block_cache[sec_cache_idx] =
+                        Some(if Cursor::is_undefined_offset(sec_addr, offset_size) {
+                            SecondaryBlock {
+                                dblk_addrs: Vec::new(),
+                                page_init: Vec::new(),
+                            }
+                        } else {
+                            parse_secondary_block_storage(
+                                storage,
+                                sec_addr,
+                                elmts_per_dblk,
                                 num_dblks,
-                                "extensible array secondary block data block count",
-                            )?,
-                            offset_size,
-                            sizeof_nelmts,
-                            page_bitmap_bytes,
-                        )?);
-                    }
+                                params,
+                            )?
+                        });
                 }
 
-                secondary_block_cache[sec_cache_idx]
-                    .as_ref()
-                    .and_then(|addrs| addrs.get(dblk_idx))
+                let Some(secondary) = secondary_block_cache[sec_cache_idx].as_ref() else {
+                    continue;
+                };
+                let dblk_addr = secondary
+                    .dblk_addrs
+                    .get(dblk_idx)
                     .copied()
-                    .unwrap_or(u64::MAX)
+                    .unwrap_or(u64::MAX);
+                let first_page_bit = checked_mul_usize(
+                    dblk_idx,
+                    data_block_pages(params.page_nelmts, elmts_per_dblk)?,
+                    "extensible array page bitmap index",
+                )?;
+                (
+                    dblk_addr,
+                    Some((secondary.page_init.as_slice(), first_page_bit)),
+                )
             };
 
             if Cursor::is_undefined_offset(dblk_addr, offset_size) {
                 continue;
             }
 
-            read_data_block_entry(
-                data,
-                dblk_addr,
-                elmts_per_dblk as usize,
-                local_idx,
-                is_filtered,
-                header.max_dblk_page_nelmts_bits,
-                offset_size,
-                header.element_size,
-                sizeof_nelmts,
-            )?
+            let block = DataBlockRef {
+                address: dblk_addr,
+                num_entries: elmts_per_dblk,
+                page_init,
+            };
+            let Some(raw) = read_data_block_entry_storage(storage, &block, local_idx, params)?
+            else {
+                continue;
+            };
+            looked_up = raw;
+            &looked_up
         };
 
         if Cursor::is_undefined_offset(raw.address, offset_size) {
@@ -1060,6 +894,30 @@ fn collect_extensible_array_chunk_entries_bounded(
     Ok(entries)
 }
 
+/// In-memory bytes viewed as storage.
+struct SliceStorage<'a>(&'a [u8]);
+
+impl Storage for SliceStorage<'_> {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read_range(&self, offset: u64, len: usize) -> Result<StorageBuffer> {
+        let start = usize::try_from(offset).map_err(|_| Error::OffsetOutOfBounds(offset))?;
+        let end = start
+            .checked_add(len)
+            .ok_or(Error::OffsetOutOfBounds(offset))?;
+        if end > self.0.len() {
+            return Err(Error::UnexpectedEof {
+                offset,
+                needed: len as u64,
+                available: self.len().saturating_sub(offset),
+            });
+        }
+        Ok(StorageBuffer::from_vec(self.0[start..end].to_vec()))
+    }
+}
+
 /// Collect chunk entries from an Extensible Array index.
 ///
 /// Walks the EAHD → EAIB → (EADB / EASB → EADB) hierarchy and converts
@@ -1073,231 +931,15 @@ pub fn collect_extensible_array_chunk_entries(
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<ChunkEntry>> {
-    let header = parse_header(data, header_address, offset_size, length_size)?;
-
-    if Cursor::is_undefined_offset(header.index_block_address, offset_size) {
-        return Ok(Vec::new());
-    }
-
-    let is_filtered = header.client_id == 1;
-    let sb_layout = compute_super_block_layout(&header);
-    let sizeof_nelmts = (header._max_nelmts_bits as usize).div_ceil(8);
-
-    if let Some(bounds) = chunk_bounds {
-        return collect_extensible_array_chunk_entries_bounded(
-            data,
-            &header,
-            offset_size,
-            dataset_shape,
-            chunk_dims,
-            bounds,
-            &sb_layout,
-            sizeof_nelmts,
-        );
-    }
-
-    // Parse the index block.
-    let mut cursor = Cursor::new(data);
-    cursor.set_position(header.index_block_address);
-
-    let sig = cursor.read_bytes(4)?;
-    if sig != EAIB_SIGNATURE {
-        return Err(Error::InvalidExtensibleArraySignature {
-            context: "index block signature mismatch",
-        });
-    }
-
-    let version = cursor.read_u8()?;
-    if version != 0 {
-        return Err(Error::Other(format!(
-            "unsupported extensible array index block version {}",
-            version
-        )));
-    }
-
-    let _client_id = cursor.read_u8()?;
-    let _header_address = cursor.read_offset(offset_size)?;
-
-    // 1. Inline elements (idx_blk_elmts entries stored directly).
-    let num_inline = header.idx_blk_elmts as usize;
-    let inline_entries = read_entries(
-        &mut cursor,
-        num_inline,
-        is_filtered,
+    collect_extensible_array_chunk_entries_storage(
+        &SliceStorage(data),
+        header_address,
         offset_size,
-        header.element_size,
-    )?;
-
-    // 2. Data block addresses stored directly in the index block.
-    // The number is 2 * sec_blk_min_data_ptrs (from HDF5: EA_IBLOCK_NDBLK_ADDRS).
-    let ndblk_addrs = 2 * header.sec_blk_min_data_ptrs as usize;
-    let mut direct_dblk_addrs = Vec::with_capacity(ndblk_addrs);
-    for _ in 0..ndblk_addrs {
-        direct_dblk_addrs.push(cursor.read_offset(offset_size)?);
-    }
-
-    // 3. Secondary block addresses for super blocks 2+.
-    // nsblk_addrs = max(0, nsblks - ndblk_addrs) where nsblks is the total
-    // number of super blocks needed to cover nelmts.
-    // compute_super_block_layout already stops once capacity >= nelmts,
-    // so sb_layout.len() is the total number of super blocks needed.
-    let nsblks = sb_layout.len();
-
-    let nsblk_addrs = nsblks.saturating_sub(ndblk_addrs);
-    let mut sec_block_addrs = Vec::with_capacity(nsblk_addrs);
-    for _ in 0..nsblk_addrs {
-        sec_block_addrs.push(cursor.read_offset(offset_size)?);
-    }
-
-    // Skip checksum at end of index block
-    let _checksum = cursor.read_u32_le()?;
-
-    // Now collect all entries.
-    let mut all_entries: Vec<EaRawEntry> = Vec::new();
-
-    // Inline entries
-    all_entries.extend(inline_entries);
-
-    // Data blocks from direct addresses (super blocks 0-1)
-    let mut dblk_addr_idx = 0;
-    for sb_idx_iter in 0..2usize.min(nsblks) {
-        if sb_idx_iter >= sb_layout.len() {
-            break;
-        }
-        let (elmts_per_dblk, num_dblks) = sb_layout[sb_idx_iter];
-        for _ in 0..num_dblks {
-            if dblk_addr_idx >= direct_dblk_addrs.len() {
-                break;
-            }
-            let dblk_addr = direct_dblk_addrs[dblk_addr_idx];
-            dblk_addr_idx += 1;
-
-            if Cursor::is_undefined_offset(dblk_addr, offset_size) {
-                for _ in 0..elmts_per_dblk {
-                    all_entries.push(EaRawEntry {
-                        address: u64::MAX,
-                        chunk_size: 0,
-                        filter_mask: 0,
-                    });
-                }
-            } else {
-                let dblk_entries = parse_data_block(
-                    data,
-                    dblk_addr,
-                    elmts_per_dblk as usize,
-                    is_filtered,
-                    header.max_dblk_page_nelmts_bits,
-                    offset_size,
-                    header.element_size,
-                    sizeof_nelmts,
-                )?;
-                all_entries.extend(dblk_entries);
-            }
-        }
-    }
-
-    // Data blocks from super blocks 2+ (via secondary blocks)
-    for (sec_idx, &sec_addr) in sec_block_addrs.iter().enumerate() {
-        let sb_idx_iter = sec_idx + 2;
-        if sb_idx_iter >= sb_layout.len() {
-            break;
-        }
-        let (elmts_per_dblk, num_dblks) = sb_layout[sb_idx_iter];
-
-        if Cursor::is_undefined_offset(sec_addr, offset_size) {
-            for _ in 0..(elmts_per_dblk * num_dblks) {
-                all_entries.push(EaRawEntry {
-                    address: u64::MAX,
-                    chunk_size: 0,
-                    filter_mask: 0,
-                });
-            }
-            continue;
-        }
-
-        // Per HDF5 spec III.H "Extensible Array Secondary Block", the secondary
-        // block contains a page initialization bitmap when data blocks are paged.
-        // Bitmap size = ceil(num_dblks * pages_per_dblk / 8).
-        let page_bitmap_bytes = secondary_page_bitmap_bytes(
-            header.max_dblk_page_nelmts_bits,
-            elmts_per_dblk,
-            num_dblks,
-        )?;
-        let dblk_addrs = parse_secondary_block(
-            data,
-            sec_addr,
-            checked_usize_from_u64(
-                num_dblks,
-                "extensible array secondary block data block count",
-            )?,
-            offset_size,
-            sizeof_nelmts,
-            page_bitmap_bytes,
-        )?;
-
-        for &dblk_addr in &dblk_addrs {
-            if Cursor::is_undefined_offset(dblk_addr, offset_size) {
-                for _ in 0..elmts_per_dblk {
-                    all_entries.push(EaRawEntry {
-                        address: u64::MAX,
-                        chunk_size: 0,
-                        filter_mask: 0,
-                    });
-                }
-            } else {
-                let dblk_entries = parse_data_block(
-                    data,
-                    dblk_addr,
-                    elmts_per_dblk as usize,
-                    is_filtered,
-                    header.max_dblk_page_nelmts_bits,
-                    offset_size,
-                    header.element_size,
-                    sizeof_nelmts,
-                )?;
-                all_entries.extend(dblk_entries);
-            }
-        }
-    }
-
-    // Convert linear indices to chunk offsets.
-    let ndim = dataset_shape.len();
-    let chunks_per_dim: Vec<u64> = (0..ndim)
-        .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
-        .collect();
-
-    let mut entries = Vec::new();
-    for (linear_idx, raw) in all_entries.iter().enumerate() {
-        if Cursor::is_undefined_offset(raw.address, offset_size) {
-            continue;
-        }
-
-        let mut remaining = linear_idx as u64;
-        let mut offsets = vec![0u64; ndim];
-        for d in (0..ndim).rev() {
-            offsets[d] = (remaining % chunks_per_dim[d]) * chunk_dims[d] as u64;
-            remaining /= chunks_per_dim[d];
-        }
-
-        if let Some((first_chunk, last_chunk)) = chunk_bounds {
-            let overlaps = offsets.iter().enumerate().all(|(dim, offset)| {
-                let chunk_index = *offset / u64::from(chunk_dims[dim]);
-                chunk_index >= first_chunk[dim] && chunk_index <= last_chunk[dim]
-            });
-            if !overlaps {
-                continue;
-            }
-        }
-
-        entries.push(ChunkEntry {
-            address: raw.address,
-            size: raw.chunk_size,
-            filter_mask: raw.filter_mask,
-            offsets,
-        });
-    }
-
-    Ok(entries)
+        length_size,
+        dataset_shape,
+        chunk_dims,
+        chunk_bounds,
+    )
 }
 
 /// Collect chunk entries from an Extensible Array index using random-access storage.
@@ -1316,340 +958,133 @@ pub fn collect_extensible_array_chunk_entries_storage(
         return Ok(Vec::new());
     }
 
-    let is_filtered = header.client_id == 1;
-    let sb_layout = compute_super_block_layout(&header);
-    let sizeof_nelmts = (header._max_nelmts_bits as usize).div_ceil(8);
+    let sb_layout = compute_super_block_layout(&header)?;
+    let params = EaParams {
+        is_filtered: header.client_id == 1,
+        offset_size,
+        entry_size: header.element_size,
+        sizeof_nelmts: usize::from(header.max_nelmts_bits).div_ceil(8),
+        page_nelmts: ea_page_nelmts(header.max_dblk_page_nelmts_bits)?,
+    };
 
     if let Some(bounds) = chunk_bounds {
-        let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(bounds));
-        let index_block = storage.read_range(
-            header.index_block_address,
-            index_block_len(&header, &sb_layout, offset_size)?,
-        )?;
-        let mut cursor = Cursor::new(index_block.as_ref());
-        let sig = cursor.read_bytes(4)?;
-        if sig != EAIB_SIGNATURE {
-            return Err(Error::InvalidExtensibleArraySignature {
-                context: "index block signature mismatch",
-            });
-        }
-        let version = cursor.read_u8()?;
-        if version != 0 {
-            return Err(Error::Other(format!(
-                "unsupported extensible array index block version {}",
-                version
-            )));
-        }
-        let _client_id = cursor.read_u8()?;
-        let _header_address = cursor.read_offset(offset_size)?;
-        let num_inline = header.idx_blk_elmts as usize;
-        let inline_start = cursor.position();
-        cursor.skip(num_inline * header.element_size as usize)?;
-
-        let ndblk_addrs = 2 * header.sec_blk_min_data_ptrs as usize;
-        let mut direct_dblk_addrs = Vec::with_capacity(ndblk_addrs);
-        for _ in 0..ndblk_addrs {
-            direct_dblk_addrs.push(cursor.read_offset(offset_size)?);
-        }
-
-        let nsblks = sb_layout.len();
-        let nsblk_addrs = nsblks.saturating_sub(ndblk_addrs);
-        let mut sec_block_addrs = Vec::with_capacity(nsblk_addrs);
-        for _ in 0..nsblk_addrs {
-            sec_block_addrs.push(cursor.read_offset(offset_size)?);
-        }
-
-        let mut secondary_block_cache: Vec<Option<Vec<u64>>> = vec![None; sec_block_addrs.len()];
-        let mut entries = Vec::new();
-
-        for (linear_idx, offsets) in targets {
-            let raw = if linear_idx < num_inline {
-                let inline_offset = inline_start
-                    + u64::try_from(linear_idx * usize::from(header.element_size)).map_err(
-                        |_| {
-                            Error::InvalidData("EA inline entry offset exceeds u64 capacity".into())
-                        },
-                    )?;
-                let position = header.index_block_address + inline_offset;
-                read_entry_at_storage(
-                    storage,
-                    position,
-                    is_filtered,
-                    offset_size,
-                    header.element_size,
-                )?
-            } else {
-                let mut relative_idx = (linear_idx - num_inline) as u64;
-                let mut sb_idx = None;
-                for (candidate_idx, (elmts_per_dblk, num_dblks)) in sb_layout.iter().enumerate() {
-                    let capacity = elmts_per_dblk * num_dblks;
-                    if relative_idx < capacity {
-                        sb_idx = Some(candidate_idx);
-                        break;
-                    }
-                    relative_idx -= capacity;
-                }
-
-                let Some(sb_idx) = sb_idx else {
-                    continue;
-                };
-                let (elmts_per_dblk, _) = sb_layout[sb_idx];
-                let dblk_idx = (relative_idx / elmts_per_dblk) as usize;
-                let local_idx = (relative_idx % elmts_per_dblk) as usize;
-
-                let dblk_addr = if sb_idx < 2 {
-                    let base = sb_layout[..sb_idx]
-                        .iter()
-                        .map(|(_, num_dblks)| *num_dblks as usize)
-                        .sum::<usize>();
-                    *direct_dblk_addrs.get(base + dblk_idx).unwrap_or(&u64::MAX)
-                } else {
-                    let sec_cache_idx = sb_idx - 2;
-                    if secondary_block_cache[sec_cache_idx].is_none() {
-                        let sec_addr = sec_block_addrs
-                            .get(sec_cache_idx)
-                            .copied()
-                            .unwrap_or(u64::MAX);
-                        if Cursor::is_undefined_offset(sec_addr, offset_size) {
-                            secondary_block_cache[sec_cache_idx] = Some(Vec::new());
-                        } else {
-                            let (_, num_dblks) = sb_layout[sb_idx];
-                            let page_bitmap_bytes = secondary_page_bitmap_bytes(
-                                header.max_dblk_page_nelmts_bits,
-                                elmts_per_dblk,
-                                num_dblks,
-                            )?;
-                            secondary_block_cache[sec_cache_idx] =
-                                Some(parse_secondary_block_storage(
-                                    storage,
-                                    sec_addr,
-                                    checked_usize_from_u64(
-                                        num_dblks,
-                                        "extensible array secondary block data block count",
-                                    )?,
-                                    offset_size,
-                                    sizeof_nelmts,
-                                    page_bitmap_bytes,
-                                )?);
-                        }
-                    }
-
-                    secondary_block_cache[sec_cache_idx]
-                        .as_ref()
-                        .and_then(|addrs| addrs.get(dblk_idx))
-                        .copied()
-                        .unwrap_or(u64::MAX)
-                };
-
-                if Cursor::is_undefined_offset(dblk_addr, offset_size) {
-                    continue;
-                }
-
-                read_data_block_entry_storage(
-                    storage,
-                    dblk_addr,
-                    checked_usize_from_u64(
-                        elmts_per_dblk,
-                        "extensible array data block element count",
-                    )?,
-                    local_idx,
-                    is_filtered,
-                    header.max_dblk_page_nelmts_bits,
-                    offset_size,
-                    header.element_size,
-                    sizeof_nelmts,
-                )?
-            };
-
-            if Cursor::is_undefined_offset(raw.address, offset_size) {
-                continue;
-            }
-
-            entries.push(ChunkEntry {
-                address: raw.address,
-                size: raw.chunk_size,
-                filter_mask: raw.filter_mask,
-                offsets,
-            });
-        }
-
-        return Ok(entries);
-    }
-
-    let index_block_len = index_block_len(&header, &sb_layout, offset_size)?;
-    let data = storage.read_range(header.index_block_address, index_block_len)?;
-    let mut cursor = Cursor::new(data.as_ref());
-    cursor.set_position(0);
-
-    let sig = cursor.read_bytes(4)?;
-    if sig != EAIB_SIGNATURE {
-        return Err(Error::InvalidExtensibleArraySignature {
-            context: "index block signature mismatch",
-        });
-    }
-
-    let version = cursor.read_u8()?;
-    if version != 0 {
-        return Err(Error::Other(format!(
-            "unsupported extensible array index block version {}",
-            version
-        )));
-    }
-
-    let _client_id = cursor.read_u8()?;
-    let _header_address = cursor.read_offset(offset_size)?;
-
-    let num_inline = header.idx_blk_elmts as usize;
-    let inline_entries = read_entries(
-        &mut cursor,
-        num_inline,
-        is_filtered,
-        offset_size,
-        header.element_size,
-    )?;
-
-    let ndblk_addrs = 2 * header.sec_blk_min_data_ptrs as usize;
-    let mut direct_dblk_addrs = Vec::with_capacity(ndblk_addrs);
-    for _ in 0..ndblk_addrs {
-        direct_dblk_addrs.push(cursor.read_offset(offset_size)?);
-    }
-
-    let nsblks = sb_layout.len();
-    let nsblk_addrs = nsblks.saturating_sub(ndblk_addrs);
-    let mut sec_block_addrs = Vec::with_capacity(nsblk_addrs);
-    for _ in 0..nsblk_addrs {
-        sec_block_addrs.push(cursor.read_offset(offset_size)?);
-    }
-    let _checksum = cursor.read_u32_le()?;
-
-    let mut all_entries: Vec<EaRawEntry> = Vec::new();
-    all_entries.extend(inline_entries);
-
-    let mut dblk_addr_idx = 0;
-    for sb_idx_iter in 0..2usize.min(nsblks) {
-        if sb_idx_iter >= sb_layout.len() {
-            break;
-        }
-        let (elmts_per_dblk, num_dblks) = sb_layout[sb_idx_iter];
-        for _ in 0..num_dblks {
-            if dblk_addr_idx >= direct_dblk_addrs.len() {
-                break;
-            }
-            let dblk_addr = direct_dblk_addrs[dblk_addr_idx];
-            dblk_addr_idx += 1;
-
-            if Cursor::is_undefined_offset(dblk_addr, offset_size) {
-                for _ in 0..elmts_per_dblk {
-                    all_entries.push(EaRawEntry {
-                        address: u64::MAX,
-                        chunk_size: 0,
-                        filter_mask: 0,
-                    });
-                }
-            } else {
-                let dblk_entries = read_data_block_storage(
-                    storage,
-                    dblk_addr,
-                    checked_usize_from_u64(
-                        elmts_per_dblk,
-                        "extensible array data block element count",
-                    )?,
-                    is_filtered,
-                    header.max_dblk_page_nelmts_bits,
-                    offset_size,
-                    header.element_size,
-                    sizeof_nelmts,
-                )?;
-                all_entries.extend(dblk_entries);
-            }
-        }
-    }
-
-    for (sb_idx_iter, &(elmts_per_dblk, num_dblks)) in sb_layout.iter().enumerate().skip(2) {
-        let sec_idx = sb_idx_iter - 2;
-        let sec_addr = *sec_block_addrs.get(sec_idx).unwrap_or(&u64::MAX);
-        if Cursor::is_undefined_offset(sec_addr, offset_size) {
-            for _ in 0..(elmts_per_dblk * num_dblks) {
-                all_entries.push(EaRawEntry {
-                    address: u64::MAX,
-                    chunk_size: 0,
-                    filter_mask: 0,
-                });
-            }
-            continue;
-        }
-
-        let page_bitmap_bytes = secondary_page_bitmap_bytes(
-            header.max_dblk_page_nelmts_bits,
-            elmts_per_dblk,
-            num_dblks,
-        )?;
-        let dblk_addrs = parse_secondary_block_storage(
+        return collect_extensible_array_chunk_entries_bounded_storage(
             storage,
-            sec_addr,
-            checked_usize_from_u64(
-                num_dblks,
-                "extensible array secondary block data block count",
-            )?,
-            offset_size,
-            sizeof_nelmts,
-            page_bitmap_bytes,
-        )?;
-
-        for dblk_addr in dblk_addrs {
-            if Cursor::is_undefined_offset(dblk_addr, offset_size) {
-                for _ in 0..elmts_per_dblk {
-                    all_entries.push(EaRawEntry {
-                        address: u64::MAX,
-                        chunk_size: 0,
-                        filter_mask: 0,
-                    });
-                }
-            } else {
-                let dblk_entries = read_data_block_storage(
-                    storage,
-                    dblk_addr,
-                    checked_usize_from_u64(
-                        elmts_per_dblk,
-                        "extensible array data block element count",
-                    )?,
-                    is_filtered,
-                    header.max_dblk_page_nelmts_bits,
-                    offset_size,
-                    header.element_size,
-                    sizeof_nelmts,
-                )?;
-                all_entries.extend(dblk_entries);
-            }
-        }
+            &header,
+            &sb_layout,
+            &params,
+            dataset_shape,
+            chunk_dims,
+            bounds,
+        );
     }
 
     let ndim = dataset_shape.len();
     let chunks_per_dim: Vec<u64> = (0..ndim)
         .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
         .collect();
+    // Entries past the dataset's chunks are not read.
+    let num_chunks = chunks_per_dim
+        .iter()
+        .fold(1u64, |count, chunks| count.saturating_mul(*chunks));
 
-    let mut entries = Vec::new();
-    for (linear_idx, raw) in all_entries.iter().enumerate() {
-        if Cursor::is_undefined_offset(raw.address, offset_size) {
+    let index = read_index_block_storage(storage, &header, &sb_layout, &params)?;
+    let (direct_sblks, _) = index_block_direct_blocks(&header, &sb_layout);
+
+    // (element index, entry) of every entry read, in element order.
+    let mut all_entries: Vec<(u64, EaRawEntry)> = index
+        .inline
+        .into_iter()
+        .enumerate()
+        .map(|(idx, raw)| (idx as u64, raw))
+        .collect();
+
+    // Element index of the next data block's first entry.
+    let mut dblk_start = u64::from(header.idx_blk_elmts);
+    let read_data_block = |block: DataBlockRef<'_>,
+                           dblk_start: u64,
+                           all_entries: &mut Vec<(u64, EaRawEntry)>|
+     -> Result<()> {
+        if Cursor::is_undefined_offset(block.address, offset_size) {
+            return Ok(());
+        }
+        let count = checked_usize_from_u64(
+            block.num_entries.min(num_chunks - dblk_start),
+            "extensible array data block element count",
+        )?;
+        for (local_idx, raw) in read_data_block_storage(storage, &block, count, &params)? {
+            all_entries.push((dblk_start + local_idx as u64, raw));
+        }
+        Ok(())
+    };
+
+    let mut direct_dblk_addrs = index.dblk_addrs.iter().copied();
+    for (sb_idx, &(elmts_per_dblk, num_dblks)) in sb_layout.iter().enumerate() {
+        if dblk_start >= num_chunks {
+            break;
+        }
+
+        if sb_idx < direct_sblks {
+            for _ in 0..num_dblks {
+                if dblk_start >= num_chunks {
+                    break;
+                }
+                let block = DataBlockRef {
+                    address: direct_dblk_addrs.next().unwrap_or(u64::MAX),
+                    num_entries: elmts_per_dblk,
+                    page_init: None,
+                };
+                read_data_block(block, dblk_start, &mut all_entries)?;
+                dblk_start = dblk_start.saturating_add(elmts_per_dblk);
+            }
             continue;
         }
 
-        let mut remaining = linear_idx as u64;
+        let sec_addr = index
+            .sblk_addrs
+            .get(sb_idx - direct_sblks)
+            .copied()
+            .unwrap_or(u64::MAX);
+        if Cursor::is_undefined_offset(sec_addr, offset_size) {
+            dblk_start = dblk_start.saturating_add(elmts_per_dblk.saturating_mul(num_dblks));
+            continue;
+        }
+
+        let secondary =
+            parse_secondary_block_storage(storage, sec_addr, elmts_per_dblk, num_dblks, &params)?;
+        let pages_per_dblk = data_block_pages(params.page_nelmts, elmts_per_dblk)?;
+        for (dblk_idx, &dblk_addr) in secondary.dblk_addrs.iter().enumerate() {
+            if dblk_start >= num_chunks {
+                break;
+            }
+            let block = DataBlockRef {
+                address: dblk_addr,
+                num_entries: elmts_per_dblk,
+                page_init: Some((
+                    secondary.page_init.as_slice(),
+                    checked_mul_usize(
+                        dblk_idx,
+                        pages_per_dblk,
+                        "extensible array page bitmap index",
+                    )?,
+                )),
+            };
+            read_data_block(block, dblk_start, &mut all_entries)?;
+            dblk_start = dblk_start.saturating_add(elmts_per_dblk);
+        }
+    }
+
+    let mut entries = Vec::new();
+    for (linear_idx, raw) in all_entries {
+        if linear_idx >= num_chunks || Cursor::is_undefined_offset(raw.address, offset_size) {
+            continue;
+        }
+
+        let mut remaining = linear_idx;
         let mut offsets = vec![0u64; ndim];
         for d in (0..ndim).rev() {
             offsets[d] = (remaining % chunks_per_dim[d]) * chunk_dims[d] as u64;
             remaining /= chunks_per_dim[d];
-        }
-
-        if let Some((first_chunk, last_chunk)) = chunk_bounds {
-            let overlaps = offsets.iter().enumerate().all(|(dim, offset)| {
-                let chunk_index = *offset / u64::from(chunk_dims[dim]);
-                chunk_index >= first_chunk[dim] && chunk_index <= last_chunk[dim]
-            });
-            if !overlaps {
-                continue;
-            }
         }
 
         entries.push(ChunkEntry {
@@ -1673,8 +1108,14 @@ mod tests {
     const TEST_LENGTH_SIZE: u8 = 8;
     const TEST_HEADER_ADDR: u64 = 0;
     const TEST_INDEX_ADDR: u64 = 128;
+    const TEST_DIRECT_DATA_BLOCK_ADDR: u64 = 256;
     const TEST_SECONDARY_ADDR: u64 = 512;
-    const TEST_DATA_BLOCK_ADDR: u64 = 768;
+    const TEST_DATA_BLOCK_ADDR: u64 = 576;
+    const TEST_PAGED_SECONDARY_ADDR: u64 = 640;
+    const TEST_PAGED_DATA_BLOCK_ADDRS: [u64; 2] = [768, 896];
+    /// Elements of the test array that are set; element `i` points at
+    /// `0x1000 + i`. See `storage_fixture` for the layout.
+    const TEST_SET_ELEMENTS: [u64; 15] = [0, 1, 2, 7, 8, 9, 10, 19, 20, 21, 22, 23, 24, 25, 26];
 
     struct RecordingStorage {
         data: Vec<u8>,
@@ -1735,17 +1176,31 @@ mod tests {
         push_u64(buf, value);
     }
 
+    fn block_prefix(signature: [u8; 4]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&signature);
+        buf.push(0); // version
+        buf.push(0); // client id
+        push_offset(&mut buf, TEST_HEADER_ADDR);
+        buf
+    }
+
+    /// An unfiltered array of 8-byte addresses with the creation parameters
+    /// below. Its super blocks (u: data blocks x elements) are 0: 1 x 2,
+    /// 1: 1 x 4, 2: 2 x 4, 3: 2 x 8, ...; the index block holds element 0 and
+    /// points directly to the data blocks of super blocks 0 and 1; super
+    /// blocks 3 and later have data blocks of two 4-element pages.
     fn ea_header_bytes(nelmts: u64) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&EAHD_SIGNATURE);
         buf.push(0); // version
         buf.push(0); // unfiltered raw chunk client
         buf.push(8); // element size: address only
-        buf.push(8); // max_nelmts_bits, so sizeof_nelmts is 1
-        buf.push(0); // inline elements
-        buf.push(1); // minimum data block elements
-        buf.push(1); // minimum secondary block data pointers
-        buf.push(0); // unpaged data blocks
+        buf.push(8); // max_nelmts_bits, so sizeof_nelmts is 1 and there are 8 super blocks
+        buf.push(1); // inline elements
+        buf.push(2); // minimum data block elements
+        buf.push(2); // minimum secondary block data pointers
+        buf.push(2); // data block pages of 4 elements
         for value in [0, 0, 0, 0, 0, nelmts] {
             push_u64(&mut buf, value);
         }
@@ -1756,51 +1211,109 @@ mod tests {
     }
 
     fn index_block_bytes() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&EAIB_SIGNATURE);
-        buf.push(0); // version
-        buf.push(0); // client id
-        push_offset(&mut buf, TEST_HEADER_ADDR);
-        push_offset(&mut buf, u64::MAX); // first direct data block
-        push_offset(&mut buf, u64::MAX); // second direct data block
-        push_offset(&mut buf, TEST_SECONDARY_ADDR);
+        let mut buf = block_prefix(EAIB_SIGNATURE);
+        push_offset(&mut buf, 0x1000); // element 0
+        push_offset(&mut buf, TEST_DIRECT_DATA_BLOCK_ADDR); // super block 0: elements 1-2
+        push_offset(&mut buf, u64::MAX); // super block 1: elements 3-6, unset
+        push_offset(&mut buf, TEST_SECONDARY_ADDR); // super block 2: elements 7-14
+        push_offset(&mut buf, TEST_PAGED_SECONDARY_ADDR); // super block 3: elements 15-30
+        for _ in 4..8 {
+            push_offset(&mut buf, u64::MAX); // super blocks 4-7
+        }
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf
     }
 
-    fn secondary_block_bytes() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&EASB_SIGNATURE);
-        buf.push(0); // version
-        buf.push(0); // client id
-        push_offset(&mut buf, TEST_HEADER_ADDR);
+    fn data_block_bytes(entries: &[u64]) -> Vec<u8> {
+        let mut buf = block_prefix(EADB_SIGNATURE);
         buf.push(0); // block offset, sizeof_nelmts = 1
-        push_offset(&mut buf, TEST_DATA_BLOCK_ADDR);
-        push_offset(&mut buf, u64::MAX);
+        for &entry in entries {
+            push_offset(&mut buf, entry);
+        }
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf
     }
 
-    fn data_block_bytes() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&EADB_SIGNATURE);
-        buf.push(0); // version
-        buf.push(0); // client id
-        push_offset(&mut buf, TEST_HEADER_ADDR);
+    fn secondary_block_bytes(page_init: &[u8], dblk_addrs: &[u64]) -> Vec<u8> {
+        let mut buf = block_prefix(EASB_SIGNATURE);
         buf.push(0); // block offset, sizeof_nelmts = 1
-        push_offset(&mut buf, 0x2000);
-        push_offset(&mut buf, 0x2010);
+        buf.extend_from_slice(page_init);
+        for &addr in dblk_addrs {
+            push_offset(&mut buf, addr);
+        }
         buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A paged data block: prefix, prefix checksum, then two pages of four
+    /// entries and a checksum each. Unwritten pages are filled with garbage.
+    fn paged_data_block_bytes(pages: [Option<u64>; 2]) -> Vec<u8> {
+        let mut buf = block_prefix(EADB_SIGNATURE);
+        buf.push(0); // block offset, sizeof_nelmts = 1
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        for page in pages {
+            for i in 0..4 {
+                push_offset(&mut buf, page.map_or(0xdead, |first| first + i));
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
         buf
     }
 
     fn storage_fixture() -> RecordingStorage {
         let mut data = vec![0u8; 4096];
-        put(&mut data, TEST_HEADER_ADDR, &ea_header_bytes(7));
+        put(&mut data, TEST_HEADER_ADDR, &ea_header_bytes(31));
         put(&mut data, TEST_INDEX_ADDR, &index_block_bytes());
-        put(&mut data, TEST_SECONDARY_ADDR, &secondary_block_bytes());
-        put(&mut data, TEST_DATA_BLOCK_ADDR, &data_block_bytes());
+        put(
+            &mut data,
+            TEST_DIRECT_DATA_BLOCK_ADDR,
+            &data_block_bytes(&[0x1001, 0x1002]),
+        );
+        // Super block 2: elements 7-10 set, 11-14 in an unset data block.
+        put(
+            &mut data,
+            TEST_SECONDARY_ADDR,
+            &secondary_block_bytes(&[], &[TEST_DATA_BLOCK_ADDR, u64::MAX]),
+        );
+        put(
+            &mut data,
+            TEST_DATA_BLOCK_ADDR,
+            &data_block_bytes(&[0x1007, 0x1008, 0x1009, 0x100a]),
+        );
+        // Super block 3: page bits 0-1 belong to the first data block (elements
+        // 15-22), bits 2-3 to the second (23-30). Only the first data block's
+        // second page (19-22) and the second data block's first page (23-26)
+        // were written: bits 1 and 2, most significant bit first.
+        put(
+            &mut data,
+            TEST_PAGED_SECONDARY_ADDR,
+            &secondary_block_bytes(&[0b0110_0000, 0], &TEST_PAGED_DATA_BLOCK_ADDRS),
+        );
+        put(
+            &mut data,
+            TEST_PAGED_DATA_BLOCK_ADDRS[0],
+            &paged_data_block_bytes([None, Some(0x1013)]),
+        );
+        put(
+            &mut data,
+            TEST_PAGED_DATA_BLOCK_ADDRS[1],
+            &paged_data_block_bytes([Some(0x1017), None]),
+        );
         RecordingStorage::new(data)
+    }
+
+    fn entry_addresses(entries: &[ChunkEntry]) -> Vec<(u64, u64)> {
+        entries
+            .iter()
+            .map(|entry| (entry.offsets[0], entry.address))
+            .collect()
+    }
+
+    fn expected_addresses() -> Vec<(u64, u64)> {
+        TEST_SET_ELEMENTS
+            .iter()
+            .map(|&idx| (idx, 0x1000 + idx))
+            .collect()
     }
 
     #[test]
@@ -1812,31 +1325,66 @@ mod tests {
     }
 
     #[test]
-    fn super_block_layout_matches_spec_rows() {
+    fn super_block_layout_matches_libhdf5() {
+        // The creation parameters libhdf5 uses for chunk indexes.
         let header = EaHeader {
             client_id: 0,
             element_size: 8,
-            _max_nelmts_bits: 32,
-            idx_blk_elmts: 2,
-            data_blk_min_elmts: 2,
-            sec_blk_min_data_ptrs: 2,
-            max_dblk_page_nelmts_bits: 0,
-            _nelmts: 100,
+            max_nelmts_bits: 32,
+            idx_blk_elmts: 4,
+            data_blk_min_elmts: 16,
+            sec_blk_min_data_ptrs: 4,
+            max_dblk_page_nelmts_bits: 10,
+            _nelmts: 0,
             index_block_address: 0,
         };
-        let layout = compute_super_block_layout(&header);
-        // sb 0: elmts_per_dblk = 2 * 2^0 = 2, num_dblks = 2 * 2^0 = 2  (cap = 4 elements)
-        assert_eq!(layout[0], (2, 2));
-        // sb 1: elmts_per_dblk = 2 * 2^0 = 2, num_dblks = 2 * 2^1 = 4  (cap = 8 elements)
-        assert_eq!(layout[1], (2, 4));
-        // sb 2: elmts_per_dblk = 2 * 2^1 = 4, num_dblks = 2 * 2^1 = 4  (cap = 16 elements)
-        assert_eq!(layout[2], (4, 4));
-        // sb 3: elmts_per_dblk = 2 * 2^1 = 4, num_dblks = 2 * 2^2 = 8  (cap = 32 elements)
-        assert_eq!(layout[3], (4, 8));
+        let layout = compute_super_block_layout(&header).unwrap();
+        // 1 + 32 - log2(16) super blocks; super block u holds 2^(u/2) data
+        // blocks of 2^((u+1)/2) * 16 elements.
+        assert_eq!(layout.len(), 29);
+        assert_eq!(
+            &layout[..6],
+            &[(16, 1), (32, 1), (32, 2), (64, 2), (64, 4), (128, 4)]
+        );
+        assert_eq!(layout[13], (2048, 64));
+        // The index block points to the 6 data blocks of super blocks 0-3
+        // (elements 4-243) and to the secondary blocks of the other 25.
+        assert_eq!(index_block_direct_blocks(&header, &layout), (4, 6));
+        let direct: u64 = layout[..4].iter().map(|(elmts, num)| elmts * num).sum();
+        assert_eq!(direct, 240);
+        assert_eq!(index_block_len(&header, &layout, 8).unwrap(), 298);
+        // Data blocks of super block 13 are the first ones split into pages.
+        assert_eq!(data_block_pages(1024, layout[12].0).unwrap(), 0);
+        assert_eq!(data_block_pages(1024, layout[13].0).unwrap(), 2);
     }
 
     #[test]
-    fn storage_full_scan_reads_exact_secondary_and_data_block_lengths() {
+    fn invalid_creation_parameters_are_errors() {
+        let mut header = EaHeader {
+            client_id: 0,
+            element_size: 8,
+            max_nelmts_bits: 32,
+            idx_blk_elmts: 4,
+            data_blk_min_elmts: 16,
+            sec_blk_min_data_ptrs: 4,
+            max_dblk_page_nelmts_bits: 10,
+            _nelmts: 0,
+            index_block_address: 0,
+        };
+        header.data_blk_min_elmts = 12;
+        assert!(compute_super_block_layout(&header).is_err());
+        header.data_blk_min_elmts = 16;
+        header.sec_blk_min_data_ptrs = 0;
+        assert!(compute_super_block_layout(&header).is_err());
+        header.sec_blk_min_data_ptrs = 4;
+        header.max_nelmts_bits = 3;
+        assert!(compute_super_block_layout(&header).is_err());
+        header.max_nelmts_bits = 65;
+        assert!(compute_super_block_layout(&header).is_err());
+    }
+
+    #[test]
+    fn full_scan_reads_direct_secondary_and_paged_data_blocks() {
         let storage = storage_fixture();
 
         let entries = collect_extensible_array_chunk_entries_storage(
@@ -1844,43 +1392,140 @@ mod tests {
             TEST_HEADER_ADDR,
             TEST_OFFSET_SIZE,
             TEST_LENGTH_SIZE,
-            &[7],
+            &[31],
             &[1],
             None,
         )
         .unwrap();
+        assert_eq!(entry_addresses(&entries), expected_addresses());
 
-        assert!(!entries.is_empty());
-        let ranges = storage.ranges();
-        assert!(ranges.contains(&(TEST_HEADER_ADDR, 72)));
-        assert!(ranges.contains(&(TEST_INDEX_ADDR, 42)));
-        assert!(ranges.contains(&(TEST_SECONDARY_ADDR, 35)));
-        assert!(ranges.contains(&(TEST_DATA_BLOCK_ADDR, 35)));
-        assert!(ranges.iter().all(|(_, len)| *len <= 72), "{ranges:?}");
+        let entries = collect_extensible_array_chunk_entries(
+            &storage.data,
+            TEST_HEADER_ADDR,
+            TEST_OFFSET_SIZE,
+            TEST_LENGTH_SIZE,
+            &[31],
+            &[1],
+            None,
+        )
+        .unwrap();
+        assert_eq!(entry_addresses(&entries), expected_addresses());
     }
 
     #[test]
-    fn storage_bounded_scan_reads_exact_index_block_length() {
+    fn bounded_scan_finds_each_element() {
         let storage = storage_fixture();
-        storage.clear_ranges();
 
+        for idx in 0..31u64 {
+            let bounds = (&[idx][..], &[idx][..]);
+            let expected: Vec<(u64, u64)> = if TEST_SET_ELEMENTS.contains(&idx) {
+                vec![(idx, 0x1000 + idx)]
+            } else {
+                Vec::new()
+            };
+
+            let entries = collect_extensible_array_chunk_entries_storage(
+                &storage,
+                TEST_HEADER_ADDR,
+                TEST_OFFSET_SIZE,
+                TEST_LENGTH_SIZE,
+                &[31],
+                &[1],
+                Some(bounds),
+            )
+            .unwrap();
+            assert_eq!(entry_addresses(&entries), expected, "element {idx}");
+
+            let entries = collect_extensible_array_chunk_entries(
+                &storage.data,
+                TEST_HEADER_ADDR,
+                TEST_OFFSET_SIZE,
+                TEST_LENGTH_SIZE,
+                &[31],
+                &[1],
+                Some(bounds),
+            )
+            .unwrap();
+            assert_eq!(entry_addresses(&entries), expected, "element {idx}");
+        }
+    }
+
+    #[test]
+    fn full_scan_stops_at_the_last_chunk() {
+        let storage = storage_fixture();
+
+        // Elements 9 and up are past the dataset's chunks: the paged super
+        // block is never read.
         let entries = collect_extensible_array_chunk_entries_storage(
             &storage,
             TEST_HEADER_ADDR,
             TEST_OFFSET_SIZE,
             TEST_LENGTH_SIZE,
-            &[7],
+            &[9],
             &[1],
-            Some((&[3], &[3])),
+            None,
         )
         .unwrap();
+        assert_eq!(
+            entry_addresses(&entries),
+            vec![
+                (0, 0x1000),
+                (1, 0x1001),
+                (2, 0x1002),
+                (7, 0x1007),
+                (8, 0x1008)
+            ]
+        );
+        assert!(storage
+            .ranges()
+            .iter()
+            .all(|(offset, _)| *offset < TEST_PAGED_SECONDARY_ADDR));
+    }
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].address, 0x2000);
+    #[test]
+    fn storage_scans_read_exact_block_lengths() {
+        let storage = storage_fixture();
+
+        collect_extensible_array_chunk_entries_storage(
+            &storage,
+            TEST_HEADER_ADDR,
+            TEST_OFFSET_SIZE,
+            TEST_LENGTH_SIZE,
+            &[31],
+            &[1],
+            None,
+        )
+        .unwrap();
         let ranges = storage.ranges();
         assert!(ranges.contains(&(TEST_HEADER_ADDR, 72)));
-        assert!(ranges.contains(&(TEST_INDEX_ADDR, 42)));
+        // prefix 14 + 1 inline entry + 2 data block and 6 secondary block
+        // addresses + checksum
+        assert!(ranges.contains(&(TEST_INDEX_ADDR, 90)));
+        // prefix 15 + 2 addresses + checksum; with a 2-byte page bitmap
         assert!(ranges.contains(&(TEST_SECONDARY_ADDR, 35)));
-        assert!(ranges.iter().all(|(_, len)| *len <= 72), "{ranges:?}");
+        assert!(ranges.contains(&(TEST_PAGED_SECONDARY_ADDR, 37)));
+        // Only the written pages of paged data blocks: after the 15-byte
+        // prefix and its checksum, pages of 4 entries and a checksum.
+        assert!(ranges.contains(&(TEST_PAGED_DATA_BLOCK_ADDRS[0] + 19 + 36, 32)));
+        assert!(ranges.contains(&(TEST_PAGED_DATA_BLOCK_ADDRS[1] + 19, 32)));
+        assert!(ranges.iter().all(|(_, len)| *len <= 90), "{ranges:?}");
+
+        storage.clear_ranges();
+        let entries = collect_extensible_array_chunk_entries_storage(
+            &storage,
+            TEST_HEADER_ADDR,
+            TEST_OFFSET_SIZE,
+            TEST_LENGTH_SIZE,
+            &[31],
+            &[1],
+            Some((&[8], &[8])),
+        )
+        .unwrap();
+        assert_eq!(entry_addresses(&entries), vec![(8, 0x1008)]);
+        let ranges = storage.ranges();
+        assert!(ranges.contains(&(TEST_INDEX_ADDR, 90)));
+        assert!(ranges.contains(&(TEST_SECONDARY_ADDR, 35)));
+        assert!(ranges.contains(&(TEST_DATA_BLOCK_ADDR + 15 + 8, 8)));
+        assert!(ranges.iter().all(|(_, len)| *len <= 90), "{ranges:?}");
     }
 }

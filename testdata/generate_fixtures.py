@@ -504,6 +504,41 @@ def generate_hdf5_fixtures(base_dir):
         ds = f.create_dataset("fill", shape=(17, 19), dtype="<i4", chunks=(5, 7), fillvalue=-7)
         ds[0:5, :] = 42
 
+    # ---- 20c. extensible_array_super_blocks.h5 ----
+    # Tests: extensible array chunk indexes that grow past the index block.
+    # libhdf5 creates them with 4 index block elements, 16 elements in the
+    # smallest data block, 4 data block pointers in the smallest secondary
+    # block and 1024-element data block pages. Super block u then holds
+    # 2^(u/2) data blocks of 2^((u+1)/2) * 16 elements: chunks 0-3 live in the
+    # index block, 4-243 in the six data blocks it points to directly (super
+    # blocks 0-3), later chunks behind secondary blocks, and from chunk 131060
+    # (super block 13: 64 data blocks of 2048 elements) the data blocks are
+    # paged, with each page's "initialized" bit in the secondary block.
+    # "data" / "data_gzip": 600 one-row chunks, all written, so every chunk up
+    # to super block 5 is set. "sparse" / "sparse_gzip": 133200 one-element
+    # chunks with fill value -1 and only a few written, among them chunks in
+    # the second page of the first paged data block (132084, 133107) and the
+    # first page of the second one (133108), whose first pages stay unwritten.
+    path = os.path.join(hdf5_dir, "extensible_array_super_blocks.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        data = np.arange(600 * 4, dtype=np.int32).reshape(600, 4)
+        for name, compression in [("data", None), ("data_gzip", "gzip")]:
+            ds = f.create_dataset(
+                name, shape=data.shape, maxshape=(None, 4), dtype=np.int32,
+                chunks=(1, 4), compression=compression
+            )
+            ds[:] = data
+        written = [0, 3, 4, 19, 20, 35, 36, 51, 52, 243, 244, 499, 500, 599,
+                   65524, 132084, 133107, 133108]
+        for name, compression in [("sparse", None), ("sparse_gzip", "gzip")]:
+            ds = f.create_dataset(
+                name, shape=(133200,), maxshape=(None,), dtype=np.int32,
+                chunks=(1,), fillvalue=-1, compression=compression
+            )
+            for i in written:
+                ds[i] = i
+
     # ---- 21. btree_v2_chunked.h5 ----
     # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets
     # with more than one unlimited dimension when libver='latest'.

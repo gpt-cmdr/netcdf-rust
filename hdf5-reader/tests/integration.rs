@@ -971,6 +971,83 @@ fn extensible_array_chunked() {
 }
 
 #[test]
+fn extensible_array_chunks_beyond_the_index_block() {
+    // Chunks 0-3 are stored in the index block, 4-243 in data blocks it points
+    // to directly, later ones behind secondary blocks; from chunk 131060 on the
+    // data blocks are paged. See generate_fixtures.py for the layout.
+    let path = skip_if_missing!("extensible_array_super_blocks.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    for name in ["/data", "/data_gzip"] {
+        let ds = file.dataset(name).unwrap();
+        assert_eq!(ds.shape(), &[600, 4], "{name}");
+        let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+        for (i, v) in data.iter().enumerate() {
+            assert_eq!(*v, i as i32, "{name} element {i}");
+        }
+
+        // A selection reads only the chunks it touches.
+        for (start, end) in [(30, 60), (240, 260), (495, 600)] {
+            let selection = hdf5_reader::SliceInfo {
+                selections: vec![
+                    hdf5_reader::SliceInfoElem::Slice {
+                        start,
+                        end,
+                        step: 1,
+                    },
+                    hdf5_reader::SliceInfoElem::Slice {
+                        start: 0,
+                        end: 4,
+                        step: 1,
+                    },
+                ],
+            };
+            let slice: ndarray::ArrayD<i32> = ds.read_slice(&selection).unwrap();
+            for (i, v) in slice.iter().enumerate() {
+                assert_eq!(
+                    *v,
+                    (start * 4) as i32 + i as i32,
+                    "{name} rows {start}..{end}"
+                );
+            }
+        }
+    }
+
+    let written = [
+        0, 3, 4, 19, 20, 35, 36, 51, 52, 243, 244, 499, 500, 599, 65524, 132084, 133107, 133108,
+    ];
+    for name in ["/sparse", "/sparse_gzip"] {
+        let ds = file.dataset(name).unwrap();
+        assert_eq!(ds.shape(), &[133200], "{name}");
+        let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+        for (i, v) in data.iter().enumerate() {
+            let expected = if written.contains(&i) { i as i32 } else { -1 };
+            assert_eq!(*v, expected, "{name} element {i}");
+        }
+
+        for (start, end) in [(131050, 131070), (132080, 132090), (133100, 133200)] {
+            let selection = hdf5_reader::SliceInfo {
+                selections: vec![hdf5_reader::SliceInfoElem::Slice {
+                    start,
+                    end,
+                    step: 1,
+                }],
+            };
+            let slice: ndarray::ArrayD<i32> = ds.read_slice(&selection).unwrap();
+            for (i, v) in slice.iter().enumerate() {
+                let index = start as usize + i;
+                let expected = if written.contains(&index) {
+                    index as i32
+                } else {
+                    -1
+                };
+                assert_eq!(*v, expected, "{name} element {index}");
+            }
+        }
+    }
+}
+
+#[test]
 fn filtered_chunk_size_fields_of_three_and_five_bytes() {
     // libhdf5 writes the chunk-size field of fixed array, extensible array and v2
     // B-tree entries 1 + (log2(chunk bytes) + 8) / 8 bytes wide: 3 bytes for the
