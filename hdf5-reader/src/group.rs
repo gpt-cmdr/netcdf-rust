@@ -186,6 +186,13 @@ impl Group {
         Err(Error::DatasetNotFound(name.to_string()))
     }
 
+    /// The group's attributes as stored, each with the exact bytes of its
+    /// datatype (see [`crate::RawAttribute`]). Values are not decoded; the
+    /// object header is parsed again for each call.
+    pub fn raw_attributes(&self) -> Result<Vec<crate::RawAttribute>> {
+        crate::attribute_api::collect_raw_attributes(&self.context, self.address)
+    }
+
     /// List attributes on this group.
     pub fn attributes(&self) -> Result<Vec<Attribute>> {
         // `cached_header` already resolves shared messages, including those

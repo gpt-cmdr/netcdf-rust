@@ -246,6 +246,40 @@ def generate_hdf5_fixtures(base_dir):
         # Reference the committed type
         ds = f.create_dataset("data", data=np.array([1.0, 2.0, 3.0]), dtype=f["my_type"].dtype)
 
+    # ---- 17e. raw_encodings.h5, raw_encodings_latest.h5 ----
+    # Tests: the exact stored bytes of datatype messages (Dataset::raw_datatype)
+    # and attribute datatypes (raw_attributes), in the earliest format (v1
+    # object headers, messages padded to 8 bytes) and the latest (v2 headers;
+    # the 20 attributes of /dense are in dense storage). "spacepad" is a
+    # space-padded fixed-length string, "padded_compound" a compound type with
+    # a gap between its members.
+    for name, libver in [
+        ("raw_encodings.h5", "earliest"),
+        ("raw_encodings_latest.h5", "latest"),
+    ]:
+        path = os.path.join(hdf5_dir, name)
+        print(f"  Generating {path}")
+        with h5py.File(path, "w", libver=libver) as f:
+            ds = f.create_dataset("f8", data=np.arange(3, dtype="<f8"))
+            ds.attrs["units"] = np.bytes_(b"m")
+            ds.attrs["scale"] = np.float32(0.5)
+            ds.attrs["labels"] = np.array([b"ab", b"cde"], dtype="S4")
+            ds.attrs["note"] = "variable-length text"
+            spacepad = h5py.h5t.C_S1.copy()
+            spacepad.set_size(6)
+            spacepad.set_strpad(h5py.h5t.STR_SPACEPAD)
+            space = h5py.h5s.create_simple((2,))
+            dsid = h5py.h5d.create(f.id, b"spacepad", spacepad, space)
+            dsid.write(h5py.h5s.ALL, h5py.h5s.ALL, np.array([b"ab    ", b"cdef  "], dtype="S6"))
+            padded = np.dtype({"names": ["a", "b"], "formats": ["<i2", "<f8"],
+                               "offsets": [0, 8], "itemsize": 16})
+            f.create_dataset("padded_compound", data=np.zeros(2, dtype=padded))
+            f.create_dataset("i2", data=np.arange(2, dtype="<i2"))
+            g = f.create_group("dense")
+            for i in range(20):
+                g.attrs[f"a{i:02d}"] = np.int32(i)
+            g.attrs["text"] = np.bytes_(b"fixed")
+
     # ---- 17b. external_links.h5 ----
     # Tests: optional external-link resolver across HDF5 files.
     target_path = os.path.join(hdf5_dir, "external_link_target.h5")

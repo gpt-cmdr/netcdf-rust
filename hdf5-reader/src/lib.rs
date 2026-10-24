@@ -60,7 +60,7 @@ use storage::DynStorage;
 use superblock::Superblock;
 
 // Re-exports
-pub use attribute_api::Attribute;
+pub use attribute_api::{Attribute, RawAttribute};
 pub use cache::ChunkCacheStats;
 use dataset::DatasetTemplate;
 pub use dataset::{Dataset, DatasetChunk, DatasetChunkIterator, SliceInfo, SliceInfoElem};
@@ -481,6 +481,29 @@ impl FileContext {
         let mut cache = self.header_cache.lock();
         cache.insert(addr, Arc::clone(&arc));
         Ok(arc)
+    }
+
+    /// Parse the object header at `addr` again, bypassing the header cache,
+    /// and record the exact datatype encodings parsed for it, including those
+    /// of shared messages it refers to.
+    pub(crate) fn parse_header_capturing(
+        &self,
+        addr: u64,
+    ) -> Result<(ObjectHeader, messages::CapturedEncodings)> {
+        let capture = messages::RawCapture::start();
+        let mut hdr = ObjectHeader::parse_at_storage(
+            self.storage.as_ref(),
+            addr,
+            self.superblock.offset_size,
+            self.superblock.length_size,
+        )?;
+        hdr.resolve_shared_messages_storage_with_sohm(
+            self.storage.as_ref(),
+            self.superblock.offset_size,
+            self.superblock.length_size,
+            |heap_id, message_type| self.resolve_sohm_message(heap_id, message_type),
+        )?;
+        Ok((hdr, capture.finish()))
     }
 
     fn resolve_sohm_message(

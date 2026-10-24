@@ -545,6 +545,103 @@ fn committed_datatype_is_not_exposed_as_group() {
     assert_eq!(datasets[0].name(), "data");
 }
 
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// `raw` is `expected` followed only by the zero padding of its message.
+fn assert_encoding(raw: &[u8], expected: &str, what: &str) {
+    let expected = hex(expected);
+    assert!(
+        raw.len() >= expected.len()
+            && raw[..expected.len()] == expected[..]
+            && raw[expected.len()..].iter().all(|&b| b == 0),
+        "{what}: stored {raw:02x?}, libhdf5 encodes {expected:02x?}"
+    );
+}
+
+#[test]
+fn raw_datatype_and_attribute_encodings() {
+    // Expected bytes are libhdf5's own encodings (h5py
+    // `TypeID.encode()[2:]`, H5Tencode without its two-byte prefix).
+    const F8: &str = "11203f000800000000004000340b0034ff030000";
+    const I2: &str = "100800000200000000001000";
+    const I4: &str = "100800000400000000002000";
+    let padded_compound = [
+        "1602000010000000610000000000000000000000000000000000000000000000000000000000000000000000\
+         000000001008000002000000000010006200000000000000080000000000000000000000000000000000000000\
+         000000000000000000000011203f000800000000004000340b0034ff030000",
+        "460200001000000061000010080000020000000000100062000811203f000800000000004000340b0034ff030000",
+    ];
+    for (i, name) in ["raw_encodings.h5", "raw_encodings_latest.h5"]
+        .into_iter()
+        .enumerate()
+    {
+        let path = skip_if_missing!(name);
+        let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+        for (dataset, expected) in [
+            ("f8", F8),
+            ("spacepad", "1302000006000000"),
+            ("padded_compound", padded_compound[i]),
+            ("i2", I2),
+        ] {
+            let ds = file.dataset(dataset).unwrap();
+            let raw = ds.raw_datatype().unwrap();
+            assert_encoding(&raw, expected, &format!("{name} {dataset}"));
+            assert_eq!(ds.raw_datatype().unwrap(), raw, "{name} {dataset} again");
+        }
+
+        let attributes = file.dataset("f8").unwrap().raw_attributes().unwrap();
+        let mut names: Vec<&str> = attributes.iter().map(|a| a.name()).collect();
+        names.sort();
+        assert_eq!(names, ["labels", "note", "scale", "units"], "{name}");
+        for attribute in &attributes {
+            let expected = match attribute.name() {
+                "units" => "1301000001000000",
+                "scale" => "11201f000400000000002000170800177f000000",
+                "labels" => "1301000004000000",
+                // Variable-length string: the stored size is the on-disk
+                // element (length and global heap reference, 16 bytes) where
+                // H5Tencode reports the in-memory size (8).
+                "note" => "1901010010000000100000000100000000000800",
+                other => panic!("unexpected attribute {other}"),
+            };
+            assert_encoding(
+                attribute.raw_datatype(),
+                expected,
+                &format!("{name} attribute {}", attribute.name()),
+            );
+        }
+        // Not decoded: the variable-length string stays a global heap reference.
+        let note = attributes.iter().find(|a| a.name() == "note").unwrap();
+        assert!(matches!(
+            note.message().datatype,
+            hdf5_reader::Datatype::VarLen { .. }
+        ));
+
+        // 21 group attributes; in the latest format they are in dense storage.
+        let attributes = file.group("/dense").unwrap().raw_attributes().unwrap();
+        assert_eq!(attributes.len(), 21, "{name}");
+        for attribute in attributes {
+            let expected = if attribute.name() == "text" {
+                "1301000005000000"
+            } else {
+                I4
+            };
+            let what = format!("{name} /dense {}", attribute.name());
+            assert_encoding(attribute.raw_datatype(), expected, &what);
+            let (message, raw) = attribute.into_parts();
+            assert_eq!(
+                message.raw_data.len(),
+                if raw[0] & 0x0f == 3 { 5 } else { 4 }
+            );
+        }
+    }
+}
+
 #[test]
 fn from_vec() {
     let path = skip_if_missing!("scalar_dataset.h5");

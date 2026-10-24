@@ -361,6 +361,84 @@ impl Attribute {
     }
 }
 
+/// An attribute message together with the exact bytes of its datatype.
+///
+/// The value is kept as stored: nothing is decoded, and variable-length
+/// values stay global heap references. [`RawAttribute::raw_datatype`] is the
+/// datatype encoding before parsing normalizes it (padding and reserved
+/// bits, compound member layout).
+#[derive(Debug, Clone)]
+pub struct RawAttribute {
+    message: AttributeMessage,
+    raw_datatype: Vec<u8>,
+}
+
+impl RawAttribute {
+    /// The parsed attribute message.
+    pub fn message(&self) -> &AttributeMessage {
+        &self.message
+    }
+
+    /// The attribute's name.
+    pub fn name(&self) -> &str {
+        &self.message.name
+    }
+
+    /// The exact bytes of the attribute's datatype, as stored.
+    pub fn raw_datatype(&self) -> &[u8] {
+        &self.raw_datatype
+    }
+
+    /// The parsed message and the datatype bytes.
+    pub fn into_parts(self) -> (AttributeMessage, Vec<u8>) {
+        (self.message, self.raw_datatype)
+    }
+}
+
+fn datatype_matches(raw: &[u8], datatype: &Datatype) -> bool {
+    messages::datatype::parse(&mut Cursor::new(raw), raw.len())
+        .is_ok_and(|parsed| parsed.datatype == *datatype)
+}
+
+/// The attributes of the object whose header is at `address`, each with the
+/// exact bytes of its datatype. The header is parsed again inside a capture.
+pub(crate) fn collect_raw_attributes(
+    context: &crate::FileContext,
+    address: u64,
+) -> Result<Vec<RawAttribute>> {
+    let (header, captured) = context.parse_header_capturing(address)?;
+    let mut raw = captured.attributes;
+    let capture = messages::RawCapture::start();
+    let attributes = collect_attribute_messages_storage(
+        &header,
+        context.storage.as_ref(),
+        context.superblock.offset_size,
+        context.superblock.length_size,
+        Some(context.filter_registry.as_ref()),
+    )?;
+    raw.extend(capture.finish().attributes);
+
+    let mut used = vec![false; raw.len()];
+    let mut result = Vec::with_capacity(attributes.len());
+    for message in attributes {
+        let found = raw.iter().enumerate().position(|(i, (name, bytes))| {
+            !used[i] && *name == message.name && datatype_matches(bytes, &message.datatype)
+        });
+        let Some(i) = found else {
+            return Err(Error::InvalidData(format!(
+                "datatype bytes of attribute '{}' not found",
+                message.name
+            )));
+        };
+        used[i] = true;
+        result.push(RawAttribute {
+            raw_datatype: std::mem::take(&mut raw[i].1),
+            message,
+        });
+    }
+    Ok(result)
+}
+
 pub(crate) fn collect_attribute_messages_storage(
     header: &ObjectHeader,
     storage: &dyn Storage,
