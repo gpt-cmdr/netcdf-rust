@@ -32,6 +32,11 @@ use crate::object_header::ObjectHeader;
 use crate::storage::DynStorage;
 use crate::FileContext;
 
+#[cfg(feature = "rayon")]
+type GatherPool<'a> = Option<&'a rayon::ThreadPool>;
+#[cfg(not(feature = "rayon"))]
+type GatherPool<'a> = Option<&'a ()>;
+
 const HOT_FULL_DATASET_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
@@ -1623,7 +1628,8 @@ impl Dataset {
         let total_elements = checked_usize(self.num_elements()?, "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
-        if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+        if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES && self.chunk_cache.capacity_bytes() != 0
+        {
             if let Some(cached_bytes) = self.full_dataset_bytes.get() {
                 return self.decode_raw_data::<T>(cached_bytes);
             }
@@ -1696,7 +1702,9 @@ impl Dataset {
                     }
                 }
 
-                if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+                if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES
+                    && self.chunk_cache.capacity_bytes() != 0
+                {
                     let mut cached_bytes = try_zeroed_bytes(total_bytes)?;
                     // SAFETY: full chunk coverage initialized all
                     // `total_bytes` at `result_ptr`, and both allocations are
@@ -1754,7 +1762,9 @@ impl Dataset {
             // SAFETY: exact, duplicate-free chunk-grid coverage was validated
             // above and every chunk was copied successfully.
             let flat_data = unsafe { assume_init_u8_vec(flat_data) };
-            if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+            if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES
+                && self.chunk_cache.capacity_bytes() != 0
+            {
                 let _ = self.full_dataset_bytes.set(Arc::new(flat_data.clone()));
             }
             return self.decode_raw_data::<T>(&flat_data);
@@ -1882,7 +1892,8 @@ impl Dataset {
         let total_elements = checked_usize(self.num_elements()?, "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
-        if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+        if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES && self.chunk_cache.capacity_bytes() != 0
+        {
             if let Some(cached_bytes) = self.full_dataset_bytes.get() {
                 return self.decode_raw_data::<T>(cached_bytes);
             }
@@ -1961,7 +1972,9 @@ impl Dataset {
                 for &dim in shape {
                     result_shape.push(checked_usize(dim, "dataset dimension")?);
                 }
-                if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+                if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES
+                    && self.chunk_cache.capacity_bytes() != 0
+                {
                     let mut cached_bytes = try_zeroed_bytes(total_bytes)?;
                     // SAFETY: full chunk coverage initialized all
                     // `total_bytes` at `flat.ptr`, and both allocations are
@@ -2016,7 +2029,9 @@ impl Dataset {
             // SAFETY: exact, duplicate-free chunk-grid coverage was validated
             // above and all parallel copies completed.
             let flat_data = unsafe { assume_init_u8_vec(flat_data) };
-            if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+            if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES
+                && self.chunk_cache.capacity_bytes() != 0
+            {
                 let _ = self.full_dataset_bytes.set(Arc::new(flat_data.clone()));
             }
             return self.decode_raw_data::<T>(&flat_data);
@@ -2199,6 +2214,253 @@ impl Dataset {
             }
         }
         Ok(entries)
+    }
+
+    /// Read a strided range of rows and a list of columns of a 2-D chunked
+    /// dataset, as a `rows x columns.len()` array.
+    ///
+    /// `rows` is `(start, end, step)` with `end` exclusive; `columns` may be in
+    /// any order and repeat. The chunk index is walked once for the selection
+    /// and each chunk is decoded at most once, copying only the selected
+    /// elements, so a few columns of a wide dataset are read without
+    /// materializing the full row range. Returns `Ok(None)` for datasets that
+    /// are not 2-D and chunked; read those with [`Dataset::read_slice`].
+    pub fn read_rows_columns_chunked<T: H5Type>(
+        &self,
+        rows: (u64, u64, u64),
+        columns: &[u64],
+    ) -> Result<Option<ArrayD<T>>> {
+        self.read_rows_columns_impl(rows, columns, false, None)
+    }
+    /// [`Dataset::read_rows_columns_chunked`], decoding chunks in parallel on
+    /// the current Rayon pool.
+    #[cfg(feature = "rayon")]
+    pub fn read_rows_columns_chunked_parallel<T: H5Type>(
+        &self,
+        rows: (u64, u64, u64),
+        columns: &[u64],
+    ) -> Result<Option<ArrayD<T>>> {
+        self.read_rows_columns_impl(rows, columns, true, None)
+    }
+    /// [`Dataset::read_rows_columns_chunked`], decoding chunks in parallel on
+    /// `pool`. The pool is entered only when chunks need decoding, so reads
+    /// served from the chunk cache stay on the calling thread.
+    #[cfg(feature = "rayon")]
+    pub fn read_rows_columns_chunked_in_pool<T: H5Type>(
+        &self,
+        rows: (u64, u64, u64),
+        columns: &[u64],
+        pool: &rayon::ThreadPool,
+    ) -> Result<Option<ArrayD<T>>> {
+        self.read_rows_columns_impl(rows, columns, true, Some(pool))
+    }
+    fn read_rows_columns_impl<T: H5Type>(
+        &self,
+        rows: (u64, u64, u64),
+        columns: &[u64],
+        parallel: bool,
+        pool: GatherPool<'_>,
+    ) -> Result<Option<ArrayD<T>>> {
+        #[cfg(not(feature = "rayon"))]
+        let _ = (parallel, pool);
+        let DataLayout::Chunked {
+            address,
+            dims,
+            chunk_indexing,
+            ..
+        } = &self.layout
+        else {
+            return Ok(None);
+        };
+        let shape = &self.dataspace.dims;
+        if shape.len() != 2 {
+            return Ok(None);
+        }
+        let chunk_shape: Vec<u64> = dims.iter().map(|&n| u64::from(n)).collect();
+        validate_chunk_shape(shape, &chunk_shape)?;
+        if rows.2 == 0
+            || rows.0 > rows.1
+            || rows.1 > shape[0]
+            || columns.iter().any(|&c| c >= shape[1])
+        {
+            return Err(Error::InvalidData("invalid row/column selection".into()));
+        }
+        let nr = checked_usize((rows.1 - rows.0).div_ceil(rows.2), "selected rows")?;
+        let count = checked_mul_usize(nr, columns.len(), "gather elements")?;
+        let elem_size = self.raw_element_size()?;
+        let len = checked_mul_usize(count, elem_size, "gather bytes")?;
+        let mut output = self.make_output_buffer(len)?;
+        if nr == 0
+            || columns.is_empty()
+            || Cursor::is_undefined_offset(*address, self.offset_size())
+        {
+            return self
+                .decode_buffer_with_shape::<T>(&output, count, &[nr, columns.len()])
+                .map(Some);
+        }
+        let mut groups = std::collections::BTreeMap::<u64, Vec<(usize, u64)>>::new();
+        for (i, &c) in columns.iter().enumerate() {
+            groups.entry(c / chunk_shape[1]).or_default().push((i, c));
+        }
+        let first_row = rows.0 / chunk_shape[0];
+        let last_selected = rows.0 + ((rows.1 - rows.0 - 1) / rows.2) * rows.2;
+        let last_row = last_selected / chunk_shape[0];
+        // One bounded index walk for the entire selection, not one per column bucket.
+        let first = [first_row, *groups.first_key_value().unwrap().0];
+        let last = [last_row, *groups.last_key_value().unwrap().0];
+        let entries = self.collect_chunk_entries(
+            *address,
+            dims,
+            chunk_indexing.as_ref(),
+            ChunkEntrySelection {
+                shape,
+                ndim: 2,
+                elem_size,
+                chunk_bounds: Some((&first, &last)),
+            },
+        )?;
+        let mut by_column = std::collections::BTreeMap::<u64, Vec<chunk_index::ChunkEntry>>::new();
+        for entry in entries {
+            if entry.offsets.len() != 2 {
+                return Err(Error::InvalidData("chunk rank mismatch".into()));
+            }
+            let col = entry.offsets[1] / chunk_shape[1];
+            if groups.contains_key(&col) {
+                by_column.entry(col).or_default().push(entry);
+            }
+        }
+        for (column_chunk, selected) in groups {
+            let first = [first_row, column_chunk];
+            let last = [last_row, column_chunk];
+            let mut entries = by_column.remove(&column_chunk).unwrap_or_default();
+            validate_chunk_grid_coverage(&mut entries, shape, &chunk_shape, &first, &last)?;
+            let gather_chunk = |entry: &chunk_index::ChunkEntry,
+                                mut direct: Option<&mut [u8]>|
+             -> Result<Vec<(usize, Vec<u8>)>> {
+                let mut pieces = Vec::new();
+                let chunk_start = entry.offsets[0];
+                let chunk_end = chunk_start
+                    .checked_add(chunk_shape[0])
+                    .ok_or_else(|| Error::InvalidData("chunk range overflow".into()))?
+                    .min(rows.1);
+                let first_selected = if chunk_start <= rows.0 {
+                    rows.0
+                } else {
+                    rows.0
+                        .checked_add(
+                            (chunk_start - rows.0)
+                                .div_ceil(rows.2)
+                                .checked_mul(rows.2)
+                                .ok_or_else(|| Error::InvalidData("row overflow".into()))?,
+                        )
+                        .ok_or_else(|| Error::InvalidData("row overflow".into()))?
+                };
+                if first_selected >= chunk_end {
+                    return Ok(pieces);
+                }
+                let data = self.load_exact_chunk_data(entry, *address, &chunk_shape, elem_size)?;
+                let mut row = first_selected;
+                while row < chunk_end {
+                    let out_row = checked_usize((row - rows.0) / rows.2, "output row")?;
+                    let mut row_data = if direct.is_none() {
+                        Vec::with_capacity(selected.len() * elem_size)
+                    } else {
+                        Vec::new()
+                    };
+                    for &(out_col, col) in &selected {
+                        let local = (row - chunk_start)
+                            .checked_mul(chunk_shape[1])
+                            .and_then(|n| n.checked_add(col - entry.offsets[1]))
+                            .ok_or_else(|| {
+                                Error::InvalidData("chunk gather offset overflow".into())
+                            })?;
+                        let src = checked_mul_usize(
+                            checked_usize(local, "chunk element")?,
+                            elem_size,
+                            "chunk byte offset",
+                        )?;
+                        let source = data
+                            .get(src..src + elem_size)
+                            .ok_or_else(|| Error::InvalidData("chunk gather bounds".into()))?;
+                        if let Some(ref mut target) = direct {
+                            let dst = (out_row * columns.len() + out_col) * elem_size;
+                            target[dst..dst + elem_size].copy_from_slice(source);
+                        } else {
+                            row_data.extend_from_slice(source);
+                        }
+                    }
+                    if direct.is_none() {
+                        pieces.push((out_row, row_data));
+                    }
+                    let Some(next) = row.checked_add(rows.2) else {
+                        break;
+                    };
+                    row = next;
+                }
+                Ok(pieces)
+            };
+            #[cfg(feature = "rayon")]
+            let mut scatter = |pieces: Vec<(usize, Vec<u8>)>| {
+                for (row, data) in pieces {
+                    for (i, &(col, _)) in selected.iter().enumerate() {
+                        let dst = (row * columns.len() + col) * elem_size;
+                        output[dst..dst + elem_size]
+                            .copy_from_slice(&data[i * elem_size..(i + 1) * elem_size]);
+                    }
+                }
+            };
+            #[cfg(feature = "rayon")]
+            let use_parallel = parallel
+                && entries.len() > 1
+                && entries.first().is_some_and(|e| {
+                    !self.chunk_cache.contains(&ChunkKey {
+                        dataset_addr: *address,
+                        chunk_offsets: SmallVec::from_slice(&e.offsets),
+                    })
+                });
+            #[cfg(feature = "rayon")]
+            if use_parallel {
+                let decode = || {
+                    entries
+                        .par_iter()
+                        .map(|entry| gather_chunk(entry, None))
+                        .collect::<Result<Vec<_>>>()
+                };
+                let pieces = if let Some(pool) = pool {
+                    pool.install(decode)
+                } else {
+                    decode()
+                }?;
+                for piece in pieces {
+                    scatter(piece);
+                }
+                continue;
+            }
+            for entry in &entries {
+                gather_chunk(entry, Some(&mut output))?;
+            }
+        }
+        self.decode_buffer_with_shape::<T>(&output, count, &[nr, columns.len()])
+            .map(Some)
+    }
+    /// Read the whole dataset like [`Dataset::read_array`], without inserting
+    /// chunks into (or evicting them from) the file's chunk cache and without
+    /// keeping a copy of the result. Useful for one-off reads of large
+    /// datasets that should not displace cached chunks. Header and chunk-index
+    /// caches are still used.
+    pub fn read_array_uncached<T: H5Type>(&self) -> Result<ArrayD<T>> {
+        let mut dataset = Self::from_template(self.context.clone(), self.template());
+        dataset.chunk_cache = Arc::new(ChunkCache::new(0, 1));
+        dataset.full_dataset_bytes = Arc::new(OnceLock::new());
+        dataset.read_array::<T>()
+    }
+    /// [`Dataset::read_array_uncached`], decoding chunks in parallel.
+    #[cfg(feature = "rayon")]
+    pub fn read_array_uncached_parallel<T: H5Type>(&self) -> Result<ArrayD<T>> {
+        let mut dataset = Self::from_template(self.context.clone(), self.template());
+        dataset.chunk_cache = Arc::new(ChunkCache::new(0, 1));
+        dataset.full_dataset_bytes = Arc::new(OnceLock::new());
+        dataset.read_array_parallel::<T>()
     }
 
     fn load_chunk_data(

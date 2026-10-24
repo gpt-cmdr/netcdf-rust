@@ -338,6 +338,26 @@ def generate_hdf5_fixtures(base_dir):
             )
             ds[:] = large
 
+    # ---- 20e. row_column_gather.h5 ----
+    # Tests: reading a row range and a column list of 2-D chunked datasets.
+    # 17x19 values v[r, c] = r * 19 + c - 123 in 5x7 chunks (partial chunks at
+    # the right and bottom edges), as little-endian float32 and float64 and
+    # big-endian int32, each unfiltered ("plain") and with shuffle + gzip
+    # ("filtered"); "fill" is int32 with fill value -7 where only rows 0-4
+    # (the first row of chunks) were written, with 42.
+    path = os.path.join(hdf5_dir, "row_column_gather.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w") as f:
+        values = np.arange(17 * 19).reshape(17, 19) - 123
+        for prefix, dtype in [("lef4", "<f4"), ("lef8", "<f8"), ("bei4", ">i4")]:
+            f.create_dataset(prefix + "plain", data=values.astype(dtype), chunks=(5, 7))
+            f.create_dataset(
+                prefix + "filtered", data=values.astype(dtype), chunks=(5, 7), shuffle=True,
+                compression="gzip"
+            )
+        ds = f.create_dataset("fill", shape=(17, 19), dtype="<i4", chunks=(5, 7), fillvalue=-7)
+        ds[0:5, :] = 42
+
     # ---- 21. btree_v2_chunked.h5 ----
     # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets
     # with more than one unlimited dimension when libver='latest'.

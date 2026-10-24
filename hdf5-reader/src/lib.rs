@@ -76,9 +76,15 @@ pub use storage::{
     RangeRequestStorage, Storage, StorageBuffer,
 };
 
+/// Default byte capacity of a file's chunk cache (64 MiB).
+pub const DEFAULT_CHUNK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Default number of chunk cache slots.
+pub const DEFAULT_CHUNK_CACHE_SLOTS: usize = 521;
+
 /// Configuration options for opening an HDF5 file.
 pub struct OpenOptions {
     /// Maximum bytes for the chunk cache. Default: 64 MiB.
+    /// Zero disables both chunk retention and the optional 32 MiB hot-array copy.
     pub chunk_cache_bytes: usize,
     /// Maximum number of chunk cache slots. Default: 521.
     pub chunk_cache_slots: usize,
@@ -94,8 +100,8 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         OpenOptions {
-            chunk_cache_bytes: 64 * 1024 * 1024,
-            chunk_cache_slots: 521,
+            chunk_cache_bytes: DEFAULT_CHUNK_CACHE_BYTES,
+            chunk_cache_slots: DEFAULT_CHUNK_CACHE_SLOTS,
             filter_registry: None,
             external_file_resolver: None,
             external_link_resolver: None,
