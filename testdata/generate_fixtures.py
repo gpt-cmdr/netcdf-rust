@@ -203,6 +203,28 @@ def generate_hdf5_fixtures(base_dir):
         data = np.eye(4, dtype=np.float32)
         f.create_dataset("checked", data=data, fletcher32=True)
 
+    # ---- 12b. chained_filters.h5 ----
+    # Tests: filter pipelines whose intermediate output is larger than the
+    # chunk, because it is still encoded by an earlier filter. "deflate_twice"
+    # applies DEFLATE twice to 8-byte chunks (one float64 each);
+    # "scaleoffset_gzip" is h5py's scaleoffset=0 + gzip on 64 int32 values
+    # that need 31 bits, so scale-offset's output (21-byte header and 248
+    # bytes of packed values) is larger than the 256-byte chunk.
+    path = os.path.join(hdf5_dir, "chained_filters.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w") as f:
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_chunk((1,))
+        dcpl.set_deflate(1)
+        dcpl.set_deflate(1)
+        space = h5py.h5s.create_simple((4,))
+        dsid = h5py.h5d.create(f.id, b"deflate_twice", h5py.h5t.IEEE_F64LE, space, dcpl=dcpl)
+        h5py.Dataset(dsid)[:] = np.array([-0.0, 1.5, 2.25, -3.0])
+        values = np.arange(64, dtype=np.int32) * np.int32(2**25 - 1)
+        f.create_dataset(
+            "scaleoffset_gzip", data=values, chunks=(64,), scaleoffset=0, compression="gzip"
+        )
+
     # ---- 13. dense_groups.h5 ----
     # Tests: dense link storage (fractal heap + B-tree v2), triggered by 20+ children.
     path = os.path.join(hdf5_dir, "dense_groups.h5")

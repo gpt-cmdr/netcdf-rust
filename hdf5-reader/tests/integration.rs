@@ -525,6 +525,31 @@ fn dense_group_dataset_lookup_from_storage() {
 }
 
 #[test]
+fn chained_filters_with_intermediates_larger_than_the_chunk() {
+    let path = skip_if_missing!("chained_filters.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    // DEFLATE applied twice: the inner zlib stream of each 8-byte chunk is
+    // longer than the chunk.
+    let data: ndarray::ArrayD<f64> = file
+        .dataset("/deflate_twice")
+        .unwrap()
+        .read_array()
+        .unwrap();
+    assert_eq!(data.as_slice().unwrap(), &[-0.0, 1.5, 2.25, -3.0]);
+
+    // gzip decodes to the scale-offset stream: 21-byte header and 248 bytes
+    // of 31-bit values, more than the 256-byte chunk.
+    let data: ndarray::ArrayD<i32> = file
+        .dataset("/scaleoffset_gzip")
+        .unwrap()
+        .read_array()
+        .unwrap();
+    let expected: Vec<i32> = (0..64).map(|i| i * ((1 << 25) - 1)).collect();
+    assert_eq!(data.as_slice().unwrap(), expected);
+}
+
+#[test]
 fn committed_datatype_is_not_exposed_as_group() {
     let path = skip_if_missing!("committed_dtype.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
