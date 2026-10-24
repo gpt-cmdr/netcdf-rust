@@ -162,6 +162,33 @@ def generate_hdf5_fixtures(base_dir):
         g["relative"] = h5py.SoftLink("inner")
         g["dangling"] = h5py.SoftLink("/missing")
 
+    # ---- 10e. old_format_large_group.h5 ----
+    # Tests: an old-style (symbol table) root group with 40 members, 20 groups
+    # g00-g19 and 20 int32 datasets d00-d19 holding their index.
+    path = os.path.join(hdf5_dir, "old_format_large_group.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest", track_order=False) as f:
+        for i in range(20):
+            f.create_group(f"g{i:02d}")
+            f.create_dataset(f"d{i:02d}", data=np.array([i], dtype=np.int32))
+
+    # ---- 10f. old_format_empty_heap_past_eof.h5 ----
+    # Tests: an empty old-style root group whose local heap data segment
+    # address points past the end of the file. Its heap holds no member name,
+    # so it must not be read. Written by h5py, then the heap's data segment
+    # address is edited.
+    path = os.path.join(hdf5_dir, "old_format_empty_heap_past_eof.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest", track_order=False) as f:
+        pass
+    with open(path, "r+b") as fh:
+        raw = fh.read()
+        assert raw.count(b"HEAP") == 1
+        # signature, version, 3 reserved bytes, data segment size and free
+        # list offset (8 bytes each), then the data segment address
+        fh.seek(raw.index(b"HEAP") + 24)
+        fh.write(struct.pack("<Q", len(raw) + 4096))
+
     # ---- 10b. compound_v1_floats.h5 ----
     # Tests: version 1 compound datatype (earliest format) whose member names start off
     # the 8-byte grid: a float member (20-byte description) followed by a fixed-length

@@ -32,6 +32,7 @@ pub struct Group {
 }
 
 /// Target of a symbol table entry in an old-style group.
+#[derive(Clone)]
 enum OldStyleTarget {
     /// Object header address.
     Hard(u64),
@@ -39,6 +40,14 @@ enum OldStyleTarget {
     Soft(String),
 }
 
+/// Names and targets of an old-style (symbol-table) group's members, cached in
+/// the file context per group address, so that listing a group and looking up
+/// its members walk its B-tree and read its local heap once.
+pub(crate) struct OldGroupEntries {
+    entries: Vec<(String, OldStyleTarget)>,
+    /// Index into `entries` of the first member with each name.
+    names: std::collections::HashMap<String, usize>,
+}
 #[derive(Clone)]
 struct ChildEntry {
     name: String,
@@ -218,6 +227,22 @@ impl Group {
         Ok((groups, datasets))
     }
 
+    /// Names of the child groups and child datasets, in listing order,
+    /// without opening the datasets or reading their attributes. Cheaper than
+    /// [`Group::members`] when only the names are needed.
+    pub fn member_names(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let mut groups = Vec::new();
+        let mut datasets = Vec::new();
+        for child in self.resolve_children()? {
+            match self.child_object_kind(&child)? {
+                ChildObjectKind::Group => groups.push(child.name),
+                ChildObjectKind::Dataset => datasets.push(child.name),
+                ChildObjectKind::Other => {}
+            }
+        }
+        Ok((groups, datasets))
+    }
+
     /// Get a child group by name.
     pub fn group(&self, name: &str) -> Result<Group> {
         self.group_in_walk(name, &LinkWalk::default())
@@ -352,13 +377,11 @@ impl Group {
         for msg in &header.messages {
             match msg {
                 HdfMessage::SymbolTable(st) => {
-                    return Ok(self
-                        .read_old_style_group_storage(st)?
-                        .into_iter()
-                        .find(|(entry_name, _)| entry_name == name)
-                        .and_then(|(entry_name, target)| {
-                            self.resolve_old_style_target(entry_name, &target, walk)
-                        }));
+                    let entries = self.old_group_entries(st)?;
+                    return Ok(entries.names.get(name).and_then(|&i| {
+                        let (entry_name, target) = &entries.entries[i];
+                        self.resolve_old_style_target(entry_name.clone(), target, walk)
+                    }));
                 }
                 HdfMessage::Link(link) if link.name == name => {
                     matching_compact_link = Some(link.clone());
@@ -402,10 +425,11 @@ impl Group {
                 HdfMessage::SymbolTable(st) => {
                     found_symbol_table = true;
                     children = self
-                        .read_old_style_group_storage(st)?
-                        .into_iter()
+                        .old_group_entries(st)?
+                        .entries
+                        .iter()
                         .filter_map(|(name, target)| {
-                            self.resolve_old_style_target(name, &target, walk)
+                            self.resolve_old_style_target(name.clone(), target, walk)
                         })
                         .collect();
                 }
@@ -518,6 +542,21 @@ impl Group {
         })
     }
 
+    fn old_group_entries(&self, st: &SymbolTableMessage) -> Result<Arc<OldGroupEntries>> {
+        let mut cache = self.context.old_groups.lock();
+        if let Some(v) = cache.get(&self.address) {
+            return Ok(v.clone());
+        }
+        let entries = self.read_old_style_group_storage(st)?;
+        let mut names = std::collections::HashMap::new();
+        for (i, (n, _)) in entries.iter().enumerate() {
+            names.entry(n.clone()).or_insert(i);
+        }
+        let value = Arc::new(OldGroupEntries { entries, names });
+        cache.insert(self.address, value.clone());
+        Ok(value)
+    }
+
     /// Names and targets of the entries of an old-style group.
     fn read_old_style_group_storage(
         &self,
@@ -540,6 +579,7 @@ impl Group {
             None,
         )?;
 
+        let mut heap_bytes = None;
         let mut children = Vec::new();
         for (_key, snod_address) in &leaves {
             let header_len = 8 + 2 * usize::from(self.offset_size());
@@ -572,8 +612,13 @@ impl Group {
             )?;
 
             for entry in &snod.entries {
-                let name =
-                    heap.get_string_storage(entry.link_name_offset, self.context.storage.as_ref())?;
+                if heap_bytes.is_none() {
+                    let len = usize::try_from(heap.data_segment_size)
+                        .map_err(|_| Error::InvalidData("heap segment exceeds usize".into()))?;
+                    heap_bytes = Some(self.context.read_range(heap.data_segment_address, len)?);
+                }
+                let segment = heap_bytes.as_ref().expect("loaded for first name").as_ref();
+                let name = heap.get_string_segment(entry.link_name_offset, segment)?;
                 let target = if entry.cache_type == 2 {
                     // A soft link: the scratch pad holds the local heap offset
                     // of the link value; the object header address is undefined.
@@ -583,9 +628,7 @@ impl Group {
                         entry.scratch[2],
                         entry.scratch[3],
                     ]);
-                    OldStyleTarget::Soft(
-                        heap.get_string_storage(u64::from(offset), self.context.storage.as_ref())?,
-                    )
+                    OldStyleTarget::Soft(heap.get_string_segment(u64::from(offset), segment)?)
                 } else {
                     OldStyleTarget::Hard(entry.object_header_address)
                 };
