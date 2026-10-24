@@ -257,6 +257,19 @@ def generate_hdf5_fixtures(base_dir):
     with h5py.File(path, "w") as f:
         f["linked_data"] = h5py.ExternalLink("external_link_target.h5", "/target_data")
 
+    # ---- 17d. soft_link_cycles.h5 ----
+    # Tests: soft links that cannot be resolved because they lead back to
+    # themselves, through an intermediate component of their own target path
+    # ("s" -> "/s/x") or through each other ("a" -> "/b", "b" -> "/a").
+    path = os.path.join(hdf5_dir, "soft_link_cycles.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        f.create_dataset("data", data=np.arange(3, dtype=np.int32))
+        f["ok"] = h5py.SoftLink("/data")
+        f["s"] = h5py.SoftLink("/s/x")
+        f["a"] = h5py.SoftLink("/b")
+        f["b"] = h5py.SoftLink("/a")
+
     # ---- 18. fixed_array_chunked.h5 ----
     # Tests: Fixed Array chunk indexing (libver='latest', fixed-size chunked).
     path = os.path.join(hdf5_dir, "fixed_array_chunked.h5")

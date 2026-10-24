@@ -453,6 +453,31 @@ fn external_raw_data_file_requires_resolver() {
 }
 
 #[test]
+fn soft_link_cycles_fail_to_resolve() {
+    let path = skip_if_missing!("soft_link_cycles.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    // "s" -> "/s/x" leads back to "s" through the first component of its
+    // own target; "a" and "b" point at each other.
+    for name in ["/s", "/s/x", "/a", "/b"] {
+        assert!(file.dataset(name).is_err(), "{name}");
+    }
+    let root = file.root_group().unwrap();
+    assert!(root.group("s").is_err());
+
+    let ok: ndarray::ArrayD<i32> = file.dataset("/ok").unwrap().read_array().unwrap();
+    assert_eq!(ok.as_slice().unwrap(), &[0, 1, 2]);
+    let mut names: Vec<String> = root
+        .datasets()
+        .unwrap()
+        .iter()
+        .map(|ds| ds.name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["data", "ok"]);
+}
+
+#[test]
 fn external_link_resolver() {
     let path = skip_if_missing!("external_links.h5");
     let base_dir = path.parent().unwrap();
