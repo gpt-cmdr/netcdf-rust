@@ -116,6 +116,23 @@ impl LocalHeap {
         Ok(s.to_string())
     }
 
+    pub(crate) fn get_string_segment(&self, offset: u64, bytes: &[u8]) -> Result<String> {
+        if offset >= self.data_segment_size {
+            return Err(Error::OffsetOutOfBounds(offset));
+        }
+        let start = usize::try_from(offset).map_err(|_| Error::OffsetOutOfBounds(offset))?;
+        let end = usize::try_from(self.data_segment_size)
+            .map_err(|_| Error::InvalidData("heap size exceeds usize".into()))?;
+        let region = bytes
+            .get(start..end)
+            .ok_or_else(|| Error::InvalidData("truncated heap segment".into()))?;
+        let nul = region.iter().position(|&b| b == 0).ok_or_else(|| {
+            Error::InvalidData("local heap string missing null terminator".into())
+        })?;
+        std::str::from_utf8(&region[..nul])
+            .map(str::to_owned)
+            .map_err(|e| Error::InvalidData(format!("invalid UTF-8 in local heap string: {e}")))
+    }
     /// Read a null-terminated string from random-access storage.
     pub fn get_string_storage(&self, offset: u64, storage: &dyn Storage) -> Result<String> {
         if offset >= self.data_segment_size {
@@ -257,5 +274,23 @@ mod tests {
             data_segment_address: 100,
         };
         assert!(heap.get_string(0, &file_data).is_err());
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+    #[test]
+    fn exact_segment_names_and_bounds() {
+        let h = LocalHeap {
+            data_segment_size: 5,
+            free_list_offset: 0,
+            data_segment_address: 0,
+        };
+        assert_eq!(h.get_string_segment(0, b"a\0bc\0").unwrap(), "a");
+        assert_eq!(h.get_string_segment(2, b"a\0bc\0").unwrap(), "bc");
+        assert!(h.get_string_segment(5, b"a\0bc\0").is_err());
+        assert!(h.get_string_segment(0, b"abcde").is_err());
+        assert!(h.get_string_segment(0, b"a").is_err());
     }
 }

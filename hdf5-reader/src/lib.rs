@@ -479,6 +479,7 @@ pub(crate) struct FileContext {
     pub(crate) superblock: Superblock,
     pub(crate) chunk_cache: Arc<ChunkCache>,
     pub(crate) header_cache: HeaderCache,
+    pub(crate) old_groups: parking_lot::Mutex<HashMap<u64, Arc<group::OldGroupEntries>>>,
     pub(crate) dataset_path_cache: Arc<parking_lot::Mutex<HashMap<String, Arc<DatasetTemplate>>>>,
     pub(crate) filter_registry: Arc<FilterRegistry>,
     pub(crate) external_file_resolver: Option<Arc<dyn ExternalFileResolver>>,
@@ -630,6 +631,7 @@ impl Hdf5File {
                 superblock,
                 chunk_cache: cache,
                 header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                old_groups: Default::default(),
                 dataset_path_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 filter_registry: Arc::new(registry),
                 external_file_resolver,
@@ -789,6 +791,100 @@ impl Hdf5File {
 mod tests {
     use super::*;
 
+    fn testdata(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../testdata/hdf5")
+            .join(name)
+    }
+
+    #[test]
+    fn old_group_cache_is_filled_once_and_does_not_keep_the_file() {
+        let path = testdata("old_format_large_group.h5");
+        if !path.exists() {
+            eprintln!("SKIPPED: fixture old_format_large_group.h5 not found");
+            return;
+        }
+        let file = Hdf5File::open(path).unwrap();
+        let weak = Arc::downgrade(&file.context);
+        let g = file.root_group().unwrap();
+        let names = g.member_names().unwrap();
+        let objects = g.members().unwrap();
+        let group_names: Vec<String> = objects.0.iter().map(|g| g.name().to_string()).collect();
+        let dataset_names: Vec<String> = objects.1.iter().map(|d| d.name().to_string()).collect();
+        assert_eq!(names, (group_names, dataset_names));
+        assert_eq!(file.context.old_groups.lock().len(), 1);
+        assert_eq!(g.member_names().unwrap(), names);
+        assert_eq!(file.context.old_groups.lock().len(), 1);
+        drop(objects);
+        drop(g);
+        drop(file);
+        assert!(
+            weak.upgrade().is_none(),
+            "the group cache must not keep the file context alive"
+        );
+    }
+
+    #[test]
+    fn old_group_cache_does_not_hold_its_lock_during_storage_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct LockProbeStorage {
+            inner: crate::storage::BytesStorage,
+            context: parking_lot::Mutex<Option<std::sync::Weak<FileContext>>>,
+            checked_reads: AtomicUsize,
+            locked_reads: AtomicUsize,
+        }
+
+        impl crate::storage::Storage for LockProbeStorage {
+            fn len(&self) -> u64 {
+                self.inner.len()
+            }
+
+            fn read_range(&self, offset: u64, len: usize) -> crate::error::Result<StorageBuffer> {
+                if let Some(context) = self.context.lock().as_ref().and_then(|weak| weak.upgrade())
+                {
+                    self.checked_reads.fetch_add(1, Ordering::Relaxed);
+                    if context.old_groups.try_lock().is_none() {
+                        self.locked_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.inner.read_range(offset, len)
+            }
+        }
+
+        let path = testdata("old_format_large_group.h5");
+        if !path.exists() {
+            eprintln!("SKIPPED: fixture old_format_large_group.h5 not found");
+            return;
+        }
+        let storage = Arc::new(LockProbeStorage {
+            inner: crate::storage::BytesStorage::new(std::fs::read(path).unwrap()),
+            context: parking_lot::Mutex::new(None),
+            checked_reads: AtomicUsize::new(0),
+            locked_reads: AtomicUsize::new(0),
+        });
+        let file = Hdf5File::from_storage(storage.clone()).unwrap();
+        *storage.context.lock() = Some(Arc::downgrade(&file.context));
+
+        file.root_group().unwrap().member_names().unwrap();
+        assert!(storage.checked_reads.load(Ordering::Relaxed) > 0);
+        assert_eq!(storage.locked_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn empty_group_does_not_read_unused_heap_segment() {
+        let path = testdata("old_format_empty_heap_past_eof.h5");
+        if !path.exists() {
+            eprintln!("SKIPPED: fixture old_format_empty_heap_past_eof.h5 not found");
+            return;
+        }
+        let file = Hdf5File::open(path).unwrap();
+        assert!(file.root_group().unwrap().members().unwrap().0.is_empty());
+        assert_eq!(
+            file.root_group().unwrap().member_names().unwrap(),
+            (vec![], vec![])
+        );
+    }
     #[test]
     fn open_options_builder_sets_every_field() {
         let opts = OpenOptions::default()
