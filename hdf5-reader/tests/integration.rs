@@ -578,6 +578,31 @@ fn stale_chunks_outside_the_extent_are_ignored() {
 }
 
 #[test]
+fn committed_datatype_used_by_datasets() {
+    // The datasets' datatype messages are shared: they refer to the committed
+    // datatypes "f8" and "i4".
+    for name in [
+        "committed_dtype_dataset.h5",
+        "committed_dtype_dataset_latest.h5",
+    ] {
+        let path = skip_if_missing!(name);
+        let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+        let data: ndarray::ArrayD<f64> = file
+            .dataset("/data")
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .read_array()
+            .unwrap();
+        assert_eq!(
+            data.as_slice().unwrap(),
+            &[0.0, 1.0, 2.0, 3.0, 4.0],
+            "{name}"
+        );
+        let ints: ndarray::ArrayD<i32> = file.dataset("/ints").unwrap().read_array().unwrap();
+        assert_eq!(ints.as_slice().unwrap(), &[-1, 0, 1], "{name}");
+    }
+}
+
+#[test]
 fn committed_datatype_is_not_exposed_as_group() {
     let path = skip_if_missing!("committed_dtype.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

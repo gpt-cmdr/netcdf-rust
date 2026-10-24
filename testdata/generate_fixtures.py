@@ -288,6 +288,21 @@ def generate_hdf5_fixtures(base_dir):
         # Reference the committed type
         ds = f.create_dataset("data", data=np.array([1.0, 2.0, 3.0]), dtype=f["my_type"].dtype)
 
+    # ---- 17c. committed_dtype_dataset.h5, committed_dtype_dataset_latest.h5 ----
+    # Tests: datasets whose datatype message is shared: it refers to a committed
+    # (named) datatype, in the earliest and the latest file format.
+    for name, libver in [
+        ("committed_dtype_dataset.h5", "earliest"),
+        ("committed_dtype_dataset_latest.h5", "latest"),
+    ]:
+        path = os.path.join(hdf5_dir, name)
+        print(f"  Generating {path}")
+        with h5py.File(path, "w", libver=libver) as f:
+            f["f8"] = np.dtype("<f8")
+            f.create_dataset("data", data=np.arange(5, dtype=np.float64), dtype=f["f8"])
+            f["i4"] = np.dtype("<i4")
+            f.create_dataset("ints", data=np.array([-1, 0, 1], dtype=np.int32), dtype=f["i4"])
+
     # ---- 17b. external_links.h5 ----
     # Tests: optional external-link resolver across HDF5 files.
     target_path = os.path.join(hdf5_dir, "external_link_target.h5")
