@@ -30,6 +30,13 @@ pub struct Group {
     pub(crate) root_address: u64,
 }
 
+/// Names and object-header addresses of an old-style (symbol-table) group, cached in
+/// the file context per group address, so that listing a group and looking up its
+/// members walk its B-tree and read its local heap once.
+pub(crate) struct OldGroupEntries {
+    entries: Vec<(String, u64)>,
+    names: std::collections::HashMap<String, u64>,
+}
 #[derive(Clone)]
 struct ChildEntry {
     name: String,
@@ -141,6 +148,22 @@ impl Group {
                         datasets.push(dataset);
                     }
                 }
+                ChildObjectKind::Other => {}
+            }
+        }
+        Ok((groups, datasets))
+    }
+
+    /// Names of the child groups and child datasets, in listing order,
+    /// without opening the datasets or reading their attributes. Cheaper than
+    /// [`Group::members`] when only the names are needed.
+    pub fn member_names(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let mut groups = Vec::new();
+        let mut datasets = Vec::new();
+        for child in self.resolve_children()? {
+            match self.child_object_kind(&child)? {
+                ChildObjectKind::Group => groups.push(child.name),
+                ChildObjectKind::Dataset => datasets.push(child.name),
                 ChildObjectKind::Other => {}
             }
         }
@@ -277,10 +300,12 @@ impl Group {
         for msg in &header.messages {
             match msg {
                 HdfMessage::SymbolTable(st) => {
-                    return Ok(self
-                        .resolve_old_style_group_storage(st)?
-                        .into_iter()
-                        .find(|child| child.name == name));
+                    let address = self.old_group_entries(st)?.names.get(name).copied();
+                    return Ok(address.map(|address| ChildEntry {
+                        name: name.into(),
+                        location: self.local_location(address),
+                        creation_order: None,
+                    }));
                 }
                 HdfMessage::Link(link) if link.name == name => {
                     matching_compact_link = Some(link.clone());
@@ -413,7 +438,33 @@ impl Group {
         }
     }
 
+    fn old_group_entries(&self, st: &SymbolTableMessage) -> Result<Arc<OldGroupEntries>> {
+        let mut cache = self.context.old_groups.lock();
+        if let Some(v) = cache.get(&self.address) {
+            return Ok(v.clone());
+        }
+        let entries = self.read_old_style_group_storage(st)?;
+        let mut names = std::collections::HashMap::new();
+        for (n, a) in &entries {
+            names.entry(n.clone()).or_insert(*a);
+        }
+        let value = Arc::new(OldGroupEntries { entries, names });
+        cache.insert(self.address, value.clone());
+        Ok(value)
+    }
     fn resolve_old_style_group_storage(&self, st: &SymbolTableMessage) -> Result<Vec<ChildEntry>> {
+        let entries = self.old_group_entries(st)?;
+        Ok(entries
+            .entries
+            .iter()
+            .map(|(n, address)| ChildEntry {
+                name: n.clone(),
+                location: self.local_location(*address),
+                creation_order: None,
+            })
+            .collect())
+    }
+    fn read_old_style_group_storage(&self, st: &SymbolTableMessage) -> Result<Vec<(String, u64)>> {
         let heap = LocalHeap::parse_at_storage(
             self.context.storage.as_ref(),
             st.heap_address,
@@ -431,6 +482,7 @@ impl Group {
             None,
         )?;
 
+        let mut heap_bytes = None;
         let mut children = Vec::new();
         for (_key, snod_address) in &leaves {
             let header_len = 8 + 2 * usize::from(self.offset_size());
@@ -463,13 +515,16 @@ impl Group {
             )?;
 
             for entry in &snod.entries {
-                let name =
-                    heap.get_string_storage(entry.link_name_offset, self.context.storage.as_ref())?;
-                children.push(ChildEntry {
-                    name,
-                    location: self.local_location(entry.object_header_address),
-                    creation_order: None,
-                });
+                if heap_bytes.is_none() {
+                    let len = usize::try_from(heap.data_segment_size)
+                        .map_err(|_| Error::InvalidData("heap segment exceeds usize".into()))?;
+                    heap_bytes = Some(self.context.read_range(heap.data_segment_address, len)?);
+                }
+                let name = heap.get_string_segment(
+                    entry.link_name_offset,
+                    heap_bytes.as_ref().expect("loaded for first name").as_ref(),
+                )?;
+                children.push((name, entry.object_header_address));
             }
         }
 

@@ -4154,6 +4154,7 @@ mod tests {
             },
             chunk_cache: Arc::new(ChunkCache::new(1024, 8)),
             header_cache: Arc::new(Mutex::new(HashMap::new())),
+            old_groups: Default::default(),
             dataset_path_cache: Arc::new(Mutex::new(HashMap::new())),
             filter_registry: Arc::new(FilterRegistry::default()),
             external_file_resolver: None,
