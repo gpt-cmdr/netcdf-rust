@@ -99,6 +99,18 @@ impl ChunkCache {
         }
     }
 
+    /// Configured byte capacity. A cache of zero bytes keeps no chunks: every
+    /// load runs directly, without in-flight bookkeeping.
+    pub fn capacity_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Inspect residency without changing statistics or LRU order.
+    #[cfg(feature = "rayon")]
+    pub(crate) fn contains(&self, key: &ChunkKey) -> bool {
+        self.inner.lock().cache.contains(key)
+    }
+
     /// Get a cached chunk, if present. Promotes the entry in LRU order.
     pub fn get(&self, key: &ChunkKey) -> Option<Arc<Vec<u8>>> {
         let mut cache = self.inner.lock();
@@ -144,6 +156,9 @@ impl ChunkCache {
     where
         F: FnOnce() -> Result<Vec<u8>>,
     {
+        if self.max_bytes == 0 {
+            return load().map(Arc::new);
+        }
         loop {
             let in_flight = {
                 let mut state = self.inner.lock();
@@ -201,7 +216,10 @@ impl ChunkCache {
 
 impl Default for ChunkCache {
     fn default() -> Self {
-        Self::new(64 * 1024 * 1024, 521)
+        Self::new(
+            crate::DEFAULT_CHUNK_CACHE_BYTES,
+            crate::DEFAULT_CHUNK_CACHE_SLOTS,
+        )
     }
 }
 
