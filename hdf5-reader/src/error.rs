@@ -135,6 +135,10 @@ pub enum Error {
     /// allows; nothing was allocated.
     #[error("resource limit: {0}")]
     ResourceLimit(String),
+    /// A valid HDF5 encoding this reader does not support, as opposed to
+    /// corrupt data.
+    #[error("unsupported encoding: {0}")]
+    UnsupportedEncoding(String),
 
     #[error("slice out of bounds: dimension {dim}, index {index}, size {size}")]
     SliceOutOfBounds { dim: usize, index: u64, size: u64 },
