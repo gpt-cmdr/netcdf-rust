@@ -58,7 +58,11 @@ fn parse_v1(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
     }
 
     // Datatype — padded to 8
+    let dt_start = cursor.position();
     let dt_msg = datatype::parse(cursor, datatype_size)?;
+    if let Some(raw) = super::raw_bytes(cursor, dt_start, datatype_size) {
+        super::record_attribute_datatype(&name, raw);
+    }
     let dt_consumed = datatype_size; // parse() already handles its own size
     let dt_padded = (dt_consumed + 7) & !7;
     if dt_padded > dt_consumed {
@@ -100,7 +104,11 @@ fn parse_v2(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
     let name = cursor.read_fixed_string(name_size)?;
 
     // Datatype
+    let dt_start = cursor.position();
     let dt_msg = datatype::parse(cursor, datatype_size)?;
+    if let Some(raw) = super::raw_bytes(cursor, dt_start, datatype_size) {
+        super::record_attribute_datatype(&name, raw);
+    }
 
     // Dataspace
     let ds_msg = dataspace::parse(cursor, offset_size, length_size, dataspace_size)?;
@@ -133,7 +141,11 @@ fn parse_v3(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
     let name = cursor.read_fixed_string(name_size)?;
 
     // Datatype
+    let dt_start = cursor.position();
     let dt_msg = datatype::parse(cursor, datatype_size)?;
+    if let Some(raw) = super::raw_bytes(cursor, dt_start, datatype_size) {
+        super::record_attribute_datatype(&name, raw);
+    }
 
     // Dataspace
     let ds_msg = dataspace::parse(cursor, offset_size, length_size, dataspace_size)?;
@@ -163,8 +175,8 @@ fn check_flags(flags: u8, version: u8) -> Result<()> {
         )));
     }
     if flags != 0 {
-        return Err(Error::InvalidData(format!(
-            "shared datatype/dataspace in attribute v{version} is not supported"
+        return Err(Error::UnsupportedEncoding(format!(
+            "shared datatype/dataspace in attribute v{version}"
         )));
     }
     Ok(())
@@ -320,6 +332,53 @@ mod tests {
             } => {}
             other => panic!("unexpected datatype: {:?}", other),
         }
+    }
+
+    fn v3_attr(flags: u8) -> Vec<u8> {
+        let dt = u32_le_datatype();
+        let ds = scalar_dataspace();
+        let mut data = vec![0x03, flags];
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&(dt.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(ds.len() as u16).to_le_bytes());
+        data.push(0x00);
+        data.extend_from_slice(b"abc\0");
+        data.extend_from_slice(&dt);
+        data.extend_from_slice(&ds);
+        data.extend_from_slice(&99u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn shared_v3_attribute_encodings_are_unsupported_not_corrupt() {
+        for flags in [1, 2, 3] {
+            let data = v3_attr(flags);
+            let err = parse(&mut Cursor::new(&data), 8, 8, data.len()).unwrap_err();
+            assert!(matches!(err, Error::UnsupportedEncoding(_)), "{err}");
+        }
+    }
+
+    #[test]
+    fn attribute_datatype_bytes_are_recorded_only_while_capturing() {
+        let data = v3_attr(0);
+        parse(&mut Cursor::new(&data), 8, 8, data.len()).unwrap();
+
+        let outer = crate::messages::RawCapture::start();
+        let inner = crate::messages::RawCapture::start();
+        parse(&mut Cursor::new(&data), 8, 8, data.len()).unwrap();
+        let captured = inner.finish();
+        assert_eq!(
+            captured.attributes,
+            vec![("abc".to_string(), u32_le_datatype())]
+        );
+        // The outer capture is active again and saw nothing of the inner one.
+        parse(&mut Cursor::new(&data), 8, 8, data.len()).unwrap();
+        assert_eq!(outer.finish().attributes.len(), 1);
+
+        // A capture dropped without finishing leaves none active.
+        drop(crate::messages::RawCapture::start());
+        let after = crate::messages::RawCapture::start();
+        assert!(after.finish().attributes.is_empty());
     }
 
     #[test]

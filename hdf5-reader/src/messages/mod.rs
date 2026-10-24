@@ -136,6 +136,75 @@ pub enum HdfMessage {
     Unknown { type_id: u16, data: Vec<u8> },
 }
 
+/// Exact encodings recorded while a [`RawCapture`] is active.
+#[derive(Debug, Default)]
+pub(crate) struct CapturedEncodings {
+    /// Payloads of datatype messages, in parse order.
+    pub(crate) datatypes: Vec<Vec<u8>>,
+    /// Attribute names with the bytes of their datatypes, in parse order.
+    pub(crate) attributes: Vec<(String, Vec<u8>)>,
+}
+
+thread_local! {
+    static CAPTURE: std::cell::RefCell<Option<CapturedEncodings>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Records the exact datatype encodings parsed on the current thread until
+/// [`RawCapture::finish`]. The parsed message types do not keep these bytes;
+/// the raw accessors re-parse an object header inside a capture instead.
+pub(crate) struct RawCapture {
+    previous: Option<CapturedEncodings>,
+    active: bool,
+}
+
+impl RawCapture {
+    pub(crate) fn start() -> Self {
+        let previous = CAPTURE.with(|c| c.replace(Some(CapturedEncodings::default())));
+        RawCapture {
+            previous,
+            active: true,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> CapturedEncodings {
+        self.active = false;
+        CAPTURE
+            .with(|c| c.replace(self.previous.take()))
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for RawCapture {
+    fn drop(&mut self) {
+        if self.active {
+            CAPTURE.with(|c| c.replace(self.previous.take()));
+        }
+    }
+}
+
+pub(crate) fn record_datatype(raw: &[u8]) {
+    CAPTURE.with(|c| {
+        if let Some(captured) = c.borrow_mut().as_mut() {
+            captured.datatypes.push(raw.to_vec());
+        }
+    });
+}
+
+pub(crate) fn record_attribute_datatype(name: &str, raw: &[u8]) {
+    CAPTURE.with(|c| {
+        if let Some(captured) = c.borrow_mut().as_mut() {
+            captured.attributes.push((name.to_string(), raw.to_vec()));
+        }
+    });
+}
+
+/// The `len` bytes at the cursor's start position `start`, if present.
+pub(crate) fn raw_bytes<'a>(cursor: &Cursor<'a>, start: u64, len: usize) -> Option<&'a [u8]> {
+    let start = usize::try_from(start).ok()?;
+    cursor.data().get(start..start.checked_add(len)?)
+}
+
 /// Parse a single header message given its type ID, size, and a cursor
 /// positioned at the start of the message payload.
 ///
@@ -161,7 +230,11 @@ pub fn parse_message(
             Ok(HdfMessage::Dataspace(msg))
         }
         MSG_DATATYPE => {
+            let start = cursor.position();
             let msg = datatype::parse(cursor, msg_size)?;
+            if let Some(raw) = raw_bytes(cursor, start, msg_size) {
+                record_datatype(raw);
+            }
             Ok(HdfMessage::Datatype(msg))
         }
         MSG_FILL_VALUE_OLD => {
