@@ -718,6 +718,36 @@ fn committed_datatype_used_by_datasets() {
 }
 
 #[test]
+fn old_format_group_lookups_reuse_the_first_listing() {
+    // 20 groups and 20 datasets in one symbol table group.
+    let path = skip_if_missing!("old_format_large_group.h5");
+    let storage = Arc::new(CountingStorage::new(std::fs::read(path).unwrap()));
+    let file = hdf5_reader::Hdf5File::from_storage(storage.clone()).unwrap();
+    let root = file.root_group().unwrap();
+    let (groups, datasets) = root.member_names().unwrap();
+    let expected =
+        |prefix: &str| -> Vec<String> { (0..20).map(|i| format!("{prefix}{i:02}")).collect() };
+    assert_eq!(groups, expected("g"));
+    assert_eq!(datasets, expected("d"));
+
+    // Lookups after the listing neither walk the symbol table nor read the
+    // local heap again.
+    storage.clear_ranges();
+    for i in 0..20 {
+        let ds = root.dataset(&format!("d{i:02}")).unwrap();
+        let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+        assert_eq!(data.as_slice().unwrap(), &[i]);
+        root.group(&format!("g{i:02}")).unwrap();
+    }
+    let ranges = storage.ranges();
+    assert!(
+        ranges.len() <= 30,
+        "40 lookups read {} ranges: {ranges:?}",
+        ranges.len()
+    );
+}
+
+#[test]
 fn committed_datatype_is_not_exposed_as_group() {
     let path = skip_if_missing!("committed_dtype.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
