@@ -9,7 +9,7 @@
 //! - `FADB` — Fixed Array Data Block
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunk_index::ChunkEntry;
+use crate::chunk_index::{ChunkEntry, ChunkSet};
 use crate::error::{Error, Result};
 use crate::io::Cursor;
 use crate::storage::Storage;
@@ -583,15 +583,13 @@ fn collect_fixed_array_chunk_entries_bounded(
     Ok(entries)
 }
 
-fn collect_fixed_array_chunk_entries_bounded_storage(
+/// Look up the entries at `targets` (linear entry index, chunk offsets).
+fn collect_fixed_array_chunk_entries_at_storage(
     storage: &dyn Storage,
     header: &FaHeader,
     offset_size: u8,
-    dataset_shape: &[u64],
-    chunk_dims: &[u32],
-    chunk_bounds: (&[u64], &[u64]),
+    targets: Vec<(usize, Vec<u64>)>,
 ) -> Result<Vec<ChunkEntry>> {
-    let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(chunk_bounds))?;
     let block_header_len = 4 + 1 + 1 + usize::from(offset_size);
     let header_bytes = storage.read_range(header.data_block_address, block_header_len)?;
     let mut cursor = Cursor::new(header_bytes.as_ref());
@@ -740,6 +738,55 @@ pub fn collect_fixed_array_chunk_entries(
     raw_entries_to_chunks(&raw_entries, offset_size, dataset_shape, chunk_dims, None)
 }
 
+/// Collect the entries of the chunks in `set` from a Fixed Array index,
+/// reading only their entries.
+pub(crate) fn collect_fixed_array_chunk_entries_in_set_storage(
+    storage: &dyn Storage,
+    header_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    dataset_shape: &[u64],
+    chunk_dims: &[u32],
+    set: &ChunkSet,
+) -> Result<Vec<ChunkEntry>> {
+    let header = parse_header_storage(storage, header_address, offset_size, length_size)?;
+    if Cursor::is_undefined_offset(header.data_block_address, offset_size)
+        || set.rank() != dataset_shape.len()
+    {
+        return Ok(Vec::new());
+    }
+    let chunks_per_dim = chunks_per_dim(dataset_shape, chunk_dims)?;
+    let mut targets = Vec::new();
+    for chunk_indices in set.chunks() {
+        if chunk_indices
+            .iter()
+            .zip(&chunks_per_dim)
+            .any(|(index, count)| index >= count)
+        {
+            continue;
+        }
+        let mut linear_idx = 0u64;
+        for (&index, &count) in chunk_indices.iter().zip(&chunks_per_dim) {
+            linear_idx = linear_idx
+                .checked_mul(count)
+                .and_then(|n| n.checked_add(index))
+                .ok_or_else(|| size_error("chunk index"))?;
+        }
+        let offsets = chunk_indices
+            .iter()
+            .zip(chunk_dims)
+            .map(|(&index, &chunk)| {
+                index
+                    .checked_mul(u64::from(chunk))
+                    .ok_or_else(|| size_error("chunk offset"))
+            })
+            .collect::<Result<Vec<u64>>>()?;
+        let linear_idx = usize::try_from(linear_idx).map_err(|_| size_error("chunk index"))?;
+        targets.push((linear_idx, offsets));
+    }
+    collect_fixed_array_chunk_entries_at_storage(storage, &header, offset_size, targets)
+}
+
 /// Collect chunk entries from a Fixed Array index using random-access storage.
 pub fn collect_fixed_array_chunk_entries_storage(
     storage: &dyn Storage,
@@ -757,13 +804,12 @@ pub fn collect_fixed_array_chunk_entries_storage(
     }
 
     if let Some(bounds) = chunk_bounds {
-        return collect_fixed_array_chunk_entries_bounded_storage(
+        let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(bounds))?;
+        return collect_fixed_array_chunk_entries_at_storage(
             storage,
             &header,
             offset_size,
-            dataset_shape,
-            chunk_dims,
-            bounds,
+            targets,
         );
     }
 

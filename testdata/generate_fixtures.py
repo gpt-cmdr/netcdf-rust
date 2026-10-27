@@ -586,6 +586,28 @@ def generate_hdf5_fixtures(base_dir):
         ds[0, 0] = 11
         ds[0, 8192] = 22
 
+    # ---- 20h. row_column_gather_wide.h5, row_column_gather_wide_v1.h5 ----
+    # Tests: gathers of widely separated columns look up only the selected
+    # chunks. 4x1000 int32 values v[r, c] = r * 1000 + c in 2x1 chunks (2000
+    # one-column chunks), indexed by a fixed array ("fixed"; paged), an
+    # extensible array ("earray"), a v2 B-tree ("btree2") and an implicit
+    # index ("implicit", allocated early), and in the _v1 file (earliest
+    # format) by a v1 B-tree ("btree1").
+    values = (np.arange(4)[:, None] * 1000 + np.arange(1000)).astype(np.int32)
+    path = os.path.join(hdf5_dir, "row_column_gather_wide.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        for name, maxshape in [("fixed", None), ("earray", (4, None)), ("btree2", (None, None))]:
+            f.create_dataset(name, data=values, chunks=(2, 1), maxshape=maxshape)
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_alloc_time(h5py.h5d.ALLOC_TIME_EARLY)
+        f.create_dataset("implicit", data=values, chunks=(2, 1), dcpl=dcpl)
+    path = os.path.join(hdf5_dir, "row_column_gather_wide_v1.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest") as f:
+        f.create_dataset("btree1", data=values, chunks=(2, 1))
+
+
     # ---- 21. btree_v2_chunked.h5 ----
     # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets
     # with more than one unlimited dimension when libver='latest'.

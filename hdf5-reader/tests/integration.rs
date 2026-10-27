@@ -1251,6 +1251,89 @@ fn paged_fixed_array_reads_initialized_pages_across_bitmap_bytes() {
 }
 
 #[test]
+fn widely_separated_column_gathers_read_only_the_selected_chunks() {
+    // 4x1000 int32 datasets in 2x1 chunks; see generate_fixtures.py (20h).
+    let datasets = [
+        ("row_column_gather_wide.h5", "fixed"),
+        ("row_column_gather_wide.h5", "earray"),
+        ("row_column_gather_wide.h5", "btree2"),
+        ("row_column_gather_wide.h5", "implicit"),
+        ("row_column_gather_wide_v1.h5", "btree1"),
+    ];
+    for (fixture, name) in datasets {
+        let path = skip_if_missing!(fixture);
+        let bytes = std::fs::read(&path).unwrap();
+        let expected: ndarray::ArrayD<i32> = hdf5_reader::Hdf5File::from_bytes(&bytes)
+            .unwrap()
+            .dataset(name)
+            .unwrap()
+            .read_array()
+            .unwrap();
+        // Byte ranges a gather reads from a freshly opened file, after the
+        // dataset's object header has been read.
+        let gather = |rows: (u64, u64, u64), columns: &[u64]| {
+            let storage = Arc::new(CountingStorage::new(bytes.clone()));
+            let file = hdf5_reader::Hdf5File::from_storage(storage.clone()).unwrap();
+            let ds = file.dataset(name).unwrap();
+            storage.clear_ranges();
+            let got = ds
+                .read_rows_columns_chunked::<i32>(rows, columns)
+                .unwrap()
+                .unwrap();
+            let ranges = storage.ranges();
+            let selected_rows: Vec<usize> = (rows.0..rows.1)
+                .step_by(rows.2 as usize)
+                .map(|row| row as usize)
+                .collect();
+            for (i, &row) in selected_rows.iter().enumerate() {
+                for (j, &col) in columns.iter().enumerate() {
+                    assert_eq!(got[[i, j]], expected[[row, col as usize]], "{name}");
+                }
+            }
+            let slice: ndarray::ArrayD<i32> = ds
+                .read_slice(&hdf5_reader::SliceInfo {
+                    selections: vec![
+                        hdf5_reader::SliceInfoElem::Slice {
+                            start: rows.0,
+                            end: rows.1,
+                            step: rows.2,
+                        },
+                        hdf5_reader::SliceInfoElem::Index(columns[0]),
+                    ],
+                })
+                .unwrap();
+            assert_eq!(
+                slice.iter().copied().collect::<Vec<_>>(),
+                (0..got.shape()[0]).map(|i| got[[i, 0]]).collect::<Vec<_>>(),
+                "{name}"
+            );
+            ranges
+        };
+
+        // Two adjacent columns and two at the far ends both select 4 chunks;
+        // the index work must not grow with the 998 column chunks between.
+        let narrow = gather((0, 4, 1), &[0, 1]);
+        let wide = gather((0, 4, 1), &[999, 0, 999]);
+        let sparse_rows = gather((0, 4, 3), &[0, 999]);
+        let bytes_read = |ranges: &[(u64, usize)]| ranges.iter().map(|r| r.1).sum::<usize>();
+        for (label, ranges) in [("wide", &wide), ("sparse rows", &sparse_rows)] {
+            assert!(
+                ranges.len() <= narrow.len() + 8 && ranges.len() <= 24,
+                "{name} {label}: {} ranges (adjacent columns: {}): {ranges:?}",
+                ranges.len(),
+                narrow.len()
+            );
+            assert!(
+                bytes_read(ranges) <= 2 * bytes_read(&narrow) + 4096,
+                "{name} {label}: {} bytes (adjacent columns: {})",
+                bytes_read(ranges),
+                bytes_read(&narrow)
+            );
+        }
+    }
+}
+
+#[test]
 fn uncached_reads_leave_the_chunk_cache_untouched() {
     let path = skip_if_missing!("row_column_gather.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
