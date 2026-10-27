@@ -453,6 +453,61 @@ fn external_raw_data_file_requires_resolver() {
 }
 
 #[test]
+fn old_format_soft_links() {
+    // Symbol table entries of soft links cache the link value instead of an
+    // object header address.
+    let path = skip_if_missing!("old_format_soft_links.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let link: ndarray::ArrayD<i32> = file.dataset("/link").unwrap().read_array().unwrap();
+    assert_eq!(link.as_slice().unwrap(), &[0, 1, 2, 3, 4]);
+    let relative: ndarray::ArrayD<i32> = file
+        .dataset("/group/relative")
+        .unwrap()
+        .read_array()
+        .unwrap();
+    assert_eq!(relative.as_slice().unwrap(), &[7, 8]);
+    let inner: ndarray::ArrayD<i32> = file
+        .group("/group_link")
+        .unwrap()
+        .dataset("inner")
+        .unwrap()
+        .read_array()
+        .unwrap();
+    assert_eq!(inner.as_slice().unwrap(), &[7, 8]);
+
+    let root = file.root_group().unwrap();
+    let mut names: Vec<String> = root
+        .datasets()
+        .unwrap()
+        .iter()
+        .map(|ds| ds.name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["data", "link"]);
+    let mut groups: Vec<String> = root
+        .groups()
+        .unwrap()
+        .iter()
+        .map(|g| g.name().to_string())
+        .collect();
+    groups.sort();
+    assert_eq!(groups, ["group", "group_link"]);
+
+    // A dangling soft link is not listed, as in new-style groups.
+    let group = file.group("/group").unwrap();
+    let mut names: Vec<String> = group
+        .datasets()
+        .unwrap()
+        .iter()
+        .map(|ds| ds.name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["inner", "relative"]);
+    assert!(group.dataset("dangling").is_err());
+}
+
+#[test]
 fn external_link_resolver() {
     let path = skip_if_missing!("external_links.h5");
     let base_dir = path.parent().unwrap();
@@ -522,6 +577,84 @@ fn dense_group_dataset_lookup_from_storage() {
         "dense lookup should not read every dense-link heap object; read {} ranges",
         ranges.len()
     );
+}
+
+#[test]
+fn chained_filters_with_intermediates_larger_than_the_chunk() {
+    let path = skip_if_missing!("chained_filters.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    // DEFLATE applied twice: the inner zlib stream of each 8-byte chunk is
+    // longer than the chunk.
+    let data: ndarray::ArrayD<f64> = file
+        .dataset("/deflate_twice")
+        .unwrap()
+        .read_array()
+        .unwrap();
+    assert_eq!(data.as_slice().unwrap(), &[-0.0, 1.5, 2.25, -3.0]);
+
+    // gzip decodes to the scale-offset stream: 21-byte header and 248 bytes
+    // of 31-bit values, more than the 256-byte chunk.
+    let data: ndarray::ArrayD<i32> = file
+        .dataset("/scaleoffset_gzip")
+        .unwrap()
+        .read_array()
+        .unwrap();
+    let expected: Vec<i32> = (0..64).map(|i| i * ((1 << 25) - 1)).collect();
+    assert_eq!(data.as_slice().unwrap(), expected);
+}
+
+#[test]
+fn stale_chunks_outside_the_extent_are_ignored() {
+    // The chunk index still holds the two chunks of rows 2-3 of a 4x4
+    // dataset that shrank to 2x4.
+    let path = skip_if_missing!("stale_chunks.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/data").unwrap();
+    assert_eq!(ds.shape(), &[2, 4]);
+    let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+    assert_eq!(data.as_slice().unwrap(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+    let selection = hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 1,
+                end: 2,
+                step: 1,
+            },
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 0,
+                end: 4,
+                step: 1,
+            },
+        ],
+    };
+    let row: ndarray::ArrayD<i32> = ds.read_slice(&selection).unwrap();
+    assert_eq!(row.as_slice().unwrap(), &[4, 5, 6, 7]);
+}
+
+#[test]
+fn committed_datatype_used_by_datasets() {
+    // The datasets' datatype messages are shared: they refer to the committed
+    // datatypes "f8" and "i4".
+    for name in [
+        "committed_dtype_dataset.h5",
+        "committed_dtype_dataset_latest.h5",
+    ] {
+        let path = skip_if_missing!(name);
+        let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+        let data: ndarray::ArrayD<f64> = file
+            .dataset("/data")
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .read_array()
+            .unwrap();
+        assert_eq!(
+            data.as_slice().unwrap(),
+            &[0.0, 1.0, 2.0, 3.0, 4.0],
+            "{name}"
+        );
+        let ints: ndarray::ArrayD<i32> = file.dataset("/ints").unwrap().read_array().unwrap();
+        assert_eq!(ints.as_slice().unwrap(), &[-1, 0, 1], "{name}");
+    }
 }
 
 #[test]
