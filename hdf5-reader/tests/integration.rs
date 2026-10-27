@@ -1232,6 +1232,25 @@ fn widely_separated_columns_skip_intervening_chunk_entries() {
 }
 
 #[test]
+fn paged_fixed_array_reads_initialized_pages_across_bitmap_bytes() {
+    let path = skip_if_missing!("fixed_array_paged_sparse.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/data").unwrap();
+
+    let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+    assert_eq!(data.shape(), &[1, 8193]);
+    assert_eq!(data[[0, 0]], 11);
+    assert_eq!(data[[0, 4096]], -7);
+    assert_eq!(data[[0, 8192]], 22);
+
+    let selected = ds
+        .read_rows_columns_chunked::<i32>((0, 1, 1), &[8192, 0, 4096])
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.as_slice().unwrap(), &[22, 11, -7]);
+}
+
+#[test]
 fn uncached_reads_leave_the_chunk_cache_untouched() {
     let path = skip_if_missing!("row_column_gather.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

@@ -574,6 +574,18 @@ def generate_hdf5_fixtures(base_dir):
         ds[0, 0] = 11
         ds[0, 1023] = 22
 
+    # ---- 20g. fixed_array_paged_sparse.h5 ----
+    # Nine 1024-entry pages with only the first and ninth initialized. The
+    # fixed-array page bitmap uses the high bit for the first page in each byte.
+    path = os.path.join(hdf5_dir, "fixed_array_paged_sparse.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset(
+            "data", shape=(1, 8193), dtype="<i4", chunks=(1, 1), fillvalue=-7
+        )
+        ds[0, 0] = 11
+        ds[0, 8192] = 22
+
     # ---- 21. btree_v2_chunked.h5 ----
     # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets
     # with more than one unlimited dimension when libver='latest'.
