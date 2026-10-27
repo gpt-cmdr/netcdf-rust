@@ -692,6 +692,7 @@ pub struct Dataset {
     full_chunk_entries: Arc<OnceLock<Arc<Vec<chunk_index::ChunkEntry>>>>,
     full_dataset_bytes: Arc<OnceLock<Arc<Vec<u8>>>>,
     external_slots: Arc<OnceLock<Arc<Vec<ResolvedExternalRawSlot>>>>,
+    raw_datatype: Arc<OnceLock<Vec<u8>>>,
     pub(crate) filter_registry: Arc<FilterRegistry>,
 }
 
@@ -769,6 +770,7 @@ pub(crate) struct DatasetTemplate {
     full_chunk_entries: Arc<OnceLock<Arc<Vec<chunk_index::ChunkEntry>>>>,
     full_dataset_bytes: Arc<OnceLock<Arc<Vec<u8>>>>,
     external_slots: Arc<OnceLock<Arc<Vec<ResolvedExternalRawSlot>>>>,
+    raw_datatype: Arc<OnceLock<Vec<u8>>>,
 }
 
 impl Dataset {
@@ -790,6 +792,7 @@ impl Dataset {
             full_chunk_entries: template.full_chunk_entries.clone(),
             full_dataset_bytes: template.full_dataset_bytes.clone(),
             external_slots: template.external_slots.clone(),
+            raw_datatype: template.raw_datatype.clone(),
         }
     }
 
@@ -808,6 +811,7 @@ impl Dataset {
             full_chunk_entries: self.full_chunk_entries.clone(),
             full_dataset_bytes: self.full_dataset_bytes.clone(),
             external_slots: self.external_slots.clone(),
+            raw_datatype: self.raw_datatype.clone(),
         })
     }
 
@@ -880,6 +884,7 @@ impl Dataset {
             full_chunk_entries: Arc::new(OnceLock::new()),
             full_dataset_bytes: Arc::new(OnceLock::new()),
             external_slots: Arc::new(OnceLock::new()),
+            raw_datatype: Arc::new(OnceLock::new()),
             filter_registry: context.context.filter_registry.clone(),
         })
     }
@@ -1000,6 +1005,36 @@ impl Dataset {
             .iter()
             .map(|a| attribute_from_message_storage(a, self.context.as_ref()))
             .collect()
+    }
+
+    /// The exact bytes of the dataset's datatype message, as stored: the
+    /// encoding [`Dataset::dtype`] was parsed from, including fields that
+    /// parsing normalizes (padding and reserved bits, compound member layout).
+    /// For a committed datatype, the bytes of the committed type's message.
+    /// The object header is parsed again on first use.
+    pub fn raw_datatype(&self) -> Result<Vec<u8>> {
+        if let Some(raw) = self.raw_datatype.get() {
+            return Ok(raw.clone());
+        }
+        let (_, captured) = self.context.parse_header_capturing(self.data_address)?;
+        let mut datatypes = captured.datatypes.into_iter();
+        let raw = match (datatypes.next(), datatypes.next()) {
+            (Some(raw), None) => raw,
+            (None, _) => return Err(Error::InvalidData("dataset has no datatype message".into())),
+            _ => {
+                return Err(Error::InvalidData(
+                    "dataset has more than one datatype message".into(),
+                ))
+            }
+        };
+        Ok(self.raw_datatype.get_or_init(|| raw).clone())
+    }
+
+    /// The dataset's attributes as stored, each with the exact bytes of its
+    /// datatype (see [`crate::RawAttribute`]). Values are not decoded; the
+    /// object header is parsed again for each call.
+    pub fn raw_attributes(&self) -> Result<Vec<crate::RawAttribute>> {
+        crate::attribute_api::collect_raw_attributes(&self.context, self.data_address)
     }
 
     /// Find an attribute by name.
@@ -4501,6 +4536,7 @@ mod tests {
             full_chunk_entries: Arc::new(OnceLock::new()),
             full_dataset_bytes: Arc::new(OnceLock::new()),
             external_slots: Arc::new(OnceLock::new()),
+            raw_datatype: Arc::new(OnceLock::new()),
             filter_registry: context.filter_registry.clone(),
         }
     }
@@ -4537,6 +4573,7 @@ mod tests {
             full_chunk_entries: Arc::new(OnceLock::new()),
             full_dataset_bytes: Arc::new(OnceLock::new()),
             external_slots: Arc::new(OnceLock::new()),
+            raw_datatype: Arc::new(OnceLock::new()),
             filter_registry: context.filter_registry.clone(),
         }
     }
