@@ -31,6 +31,14 @@ pub struct Group {
     pub(crate) root_address: u64,
 }
 
+/// Target of a symbol table entry in an old-style group.
+enum OldStyleTarget {
+    /// Object header address.
+    Hard(u64),
+    /// Soft link value (symbol table entry cache type 2).
+    Soft(String),
+}
+
 #[derive(Clone)]
 struct ChildEntry {
     name: String,
@@ -345,9 +353,12 @@ impl Group {
             match msg {
                 HdfMessage::SymbolTable(st) => {
                     return Ok(self
-                        .resolve_old_style_group_storage(st)?
+                        .read_old_style_group_storage(st)?
                         .into_iter()
-                        .find(|child| child.name == name));
+                        .find(|(entry_name, _)| entry_name == name)
+                        .and_then(|(entry_name, target)| {
+                            self.resolve_old_style_target(entry_name, &target, walk)
+                        }));
                 }
                 HdfMessage::Link(link) if link.name == name => {
                     matching_compact_link = Some(link.clone());
@@ -374,7 +385,7 @@ impl Group {
         Ok(None)
     }
 
-    /// Resolve children with a soft-link depth counter to prevent cycles.
+    /// Resolve children with a shared link walk to prevent cycles.
     fn resolve_children_with_link_depth(&self, walk: &LinkWalk) -> Result<Vec<ChildEntry>> {
         let header = self.cached_header(self.address)?;
 
@@ -390,7 +401,13 @@ impl Group {
             match msg {
                 HdfMessage::SymbolTable(st) => {
                     found_symbol_table = true;
-                    children = self.resolve_old_style_group_storage(st)?;
+                    children = self
+                        .read_old_style_group_storage(st)?
+                        .into_iter()
+                        .filter_map(|(name, target)| {
+                            self.resolve_old_style_target(name, &target, walk)
+                        })
+                        .collect();
                 }
                 HdfMessage::Link(link) => {
                     links.push(link.clone());
@@ -482,7 +499,30 @@ impl Group {
         }
     }
 
-    fn resolve_old_style_group_storage(&self, st: &SymbolTableMessage) -> Result<Vec<ChildEntry>> {
+    /// Resolve a symbol table entry. Like soft links in link messages, a soft
+    /// link whose target cannot be resolved is left out.
+    fn resolve_old_style_target(
+        &self,
+        name: String,
+        target: &OldStyleTarget,
+        walk: &LinkWalk,
+    ) -> Option<ChildEntry> {
+        let location = match target {
+            OldStyleTarget::Hard(address) => self.local_location(*address),
+            OldStyleTarget::Soft(path) => self.resolve_soft_link(path, walk).ok()?,
+        };
+        Some(ChildEntry {
+            name,
+            location,
+            creation_order: None,
+        })
+    }
+
+    /// Names and targets of the entries of an old-style group.
+    fn read_old_style_group_storage(
+        &self,
+        st: &SymbolTableMessage,
+    ) -> Result<Vec<(String, OldStyleTarget)>> {
         let heap = LocalHeap::parse_at_storage(
             self.context.storage.as_ref(),
             st.heap_address,
@@ -534,11 +574,22 @@ impl Group {
             for entry in &snod.entries {
                 let name =
                     heap.get_string_storage(entry.link_name_offset, self.context.storage.as_ref())?;
-                children.push(ChildEntry {
-                    name,
-                    location: self.local_location(entry.object_header_address),
-                    creation_order: None,
-                });
+                let target = if entry.cache_type == 2 {
+                    // A soft link: the scratch pad holds the local heap offset
+                    // of the link value; the object header address is undefined.
+                    let offset = u32::from_le_bytes([
+                        entry.scratch[0],
+                        entry.scratch[1],
+                        entry.scratch[2],
+                        entry.scratch[3],
+                    ]);
+                    OldStyleTarget::Soft(
+                        heap.get_string_storage(u64::from(offset), self.context.storage.as_ref())?,
+                    )
+                } else {
+                    OldStyleTarget::Hard(entry.object_header_address)
+                };
+                children.push((name, target));
             }
         }
 

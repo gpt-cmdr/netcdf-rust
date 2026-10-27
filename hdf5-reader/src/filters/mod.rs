@@ -176,10 +176,34 @@ pub fn apply_pipeline_with_limit(
             None => data,
         };
 
+        // A decoded intermediate may still be compressed by an earlier filter.
+        // Its bound is the forward encoded-size bound of that prefix, not the
+        // final chunk size (e.g. two DEFLATE filters on an eight-byte chunk).
+        // A prefix with no known bound leaves the stage unbounded; the final
+        // output is still checked against the limit.
+        let stage_limit = max_output_len.and_then(|n| {
+            filters[..i]
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| filter_mask & (1 << j) == 0)
+                .try_fold(n, |n, (_, earlier)| {
+                    let custom = registry.is_some_and(|reg| {
+                        matches!(
+                            reg.filters.get(&earlier.id),
+                            Some(FilterImplementation::Custom(_))
+                        )
+                    });
+                    if custom {
+                        None
+                    } else {
+                        encoded_size_bound(earlier.id, n)
+                    }
+                })
+        });
         owned = Some(if let Some(reg) = registry {
-            reg.apply_with_limit(filter, input, element_size, max_output_len)?
+            reg.apply_with_limit(filter, input, element_size, stage_limit)?
         } else {
-            apply_builtin_filter_with_limit(filter, input, element_size, max_output_len)?
+            apply_builtin_filter_with_limit(filter, input, element_size, stage_limit)?
         });
     }
 
@@ -237,12 +261,73 @@ fn validate_output_limit(context: &str, len: usize, max_output_len: Option<usize
     Ok(())
 }
 
+/// Forward encoded-size bound of a built-in filter applied to `n` bytes, or
+/// `None` when the codec has no bound known here (unknown filters, LZ4).
+fn encoded_size_bound(id: u16, n: usize) -> Option<usize> {
+    Some(match id {
+        // zlib's compressBound.
+        FILTER_DEFLATE => n
+            .saturating_add(n >> 12)
+            .saturating_add(n >> 14)
+            .saturating_add(n >> 25)
+            .saturating_add(13),
+        FILTER_FLETCHER32 => n.saturating_add(4),
+        // HDF5 scale-offset header plus at most one padding byte.
+        FILTER_SCALEOFFSET => n.saturating_add(22),
+        FILTER_SHUFFLE | FILTER_NBIT => n,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn intermediate_stages_are_bounded_by_the_earlier_filters() {
+        // DEFLATE twice on an eight-byte chunk: the inner stream is longer
+        // than the chunk.
+        let raw = (-3.0f64).to_le_bytes();
+        let once = zlib(&raw);
+        let twice = zlib(&once);
+        assert!(once.len() > raw.len());
+        let filters = vec![
+            FilterDescription {
+                id: FILTER_DEFLATE,
+                name: None,
+                client_data: vec![1],
+            };
+            2
+        ];
+        for registry in [None, Some(FilterRegistry::new())] {
+            let registry = registry.as_ref();
+            assert_eq!(
+                apply_pipeline_with_limit(&twice, &filters, 0, 8, registry, Some(8)).unwrap(),
+                raw
+            );
+            // Second filter skipped (mask bit 1): one DEFLATE stream remains.
+            assert_eq!(
+                apply_pipeline_with_limit(&once, &filters, 0b10, 8, registry, Some(8)).unwrap(),
+                raw
+            );
+        }
+
+        assert_eq!(encoded_size_bound(FILTER_SCALEOFFSET, 256), Some(278));
+        assert_eq!(
+            encoded_size_bound(FILTER_DEFLATE, usize::MAX),
+            Some(usize::MAX)
+        );
+        assert_eq!(encoded_size_bound(50000, 256), None);
+    }
 
     #[test]
     fn filter_registry_default() {

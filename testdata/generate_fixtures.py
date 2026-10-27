@@ -10,6 +10,7 @@ relative to this script's location.
 """
 
 import os
+import struct
 import subprocess
 import sys
 import numpy as np
@@ -146,6 +147,21 @@ def generate_hdf5_fixtures(base_dir):
         data = np.arange(20, dtype=np.float64).reshape(4, 5)
         f.create_dataset("data", data=data)
 
+    # ---- 10d. old_format_soft_links.h5 ----
+    # Tests: soft links in v1 (symbol table) groups. Their symbol table entries
+    # hold no object header address; the scratch pad holds the local heap offset
+    # of the link value instead.
+    path = os.path.join(hdf5_dir, "old_format_soft_links.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest", track_order=False) as f:
+        f.create_dataset("data", data=np.arange(5, dtype=np.int32))
+        g = f.create_group("group")
+        g.create_dataset("inner", data=np.array([7, 8], dtype=np.int32))
+        f["link"] = h5py.SoftLink("/data")
+        f["group_link"] = h5py.SoftLink("/group")
+        g["relative"] = h5py.SoftLink("inner")
+        g["dangling"] = h5py.SoftLink("/missing")
+
     # ---- 10b. compound_v1_floats.h5 ----
     # Tests: version 1 compound datatype (earliest format) whose member names start off
     # the 8-byte grid: a float member (20-byte description) followed by a fixed-length
@@ -203,6 +219,28 @@ def generate_hdf5_fixtures(base_dir):
         data = np.eye(4, dtype=np.float32)
         f.create_dataset("checked", data=data, fletcher32=True)
 
+    # ---- 12b. chained_filters.h5 ----
+    # Tests: filter pipelines whose intermediate output is larger than the
+    # chunk, because it is still encoded by an earlier filter. "deflate_twice"
+    # applies DEFLATE twice to 8-byte chunks (one float64 each);
+    # "scaleoffset_gzip" is h5py's scaleoffset=0 + gzip on 64 int32 values
+    # that need 31 bits, so scale-offset's output (21-byte header and 248
+    # bytes of packed values) is larger than the 256-byte chunk.
+    path = os.path.join(hdf5_dir, "chained_filters.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w") as f:
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_chunk((1,))
+        dcpl.set_deflate(1)
+        dcpl.set_deflate(1)
+        space = h5py.h5s.create_simple((4,))
+        dsid = h5py.h5d.create(f.id, b"deflate_twice", h5py.h5t.IEEE_F64LE, space, dcpl=dcpl)
+        h5py.Dataset(dsid)[:] = np.array([-0.0, 1.5, 2.25, -3.0])
+        values = np.arange(64, dtype=np.int32) * np.int32(2**25 - 1)
+        f.create_dataset(
+            "scaleoffset_gzip", data=values, chunks=(64,), scaleoffset=0, compression="gzip"
+        )
+
     # ---- 13. dense_groups.h5 ----
     # Tests: dense link storage (fractal heap + B-tree v2), triggered by 20+ children.
     path = os.path.join(hdf5_dir, "dense_groups.h5")
@@ -236,6 +274,25 @@ def generate_hdf5_fixtures(base_dir):
         data = np.arange(20, dtype=np.float64).reshape(4, 5)
         f.create_dataset("data", data=data, chunks=(4, 5))
 
+    # ---- 16b. stale_chunks.h5 ----
+    # Tests: chunk index entries wholly outside the dataset's extent, as some
+    # writers leave them when a dataset shrinks. libhdf5 removes such chunks,
+    # so this writes 4x4 int32 values in 2x2 chunks (v1 B-tree index) and then
+    # edits the dataspace to 2x4: the two chunks of rows 2-3 become stale.
+    path = os.path.join(hdf5_dir, "stale_chunks.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest") as f:
+        f.create_dataset(
+            "data", data=np.arange(16, dtype=np.int32).reshape(4, 4), chunks=(2, 2),
+            maxshape=(None, 4)
+        )
+    with open(path, "r+b") as fh:
+        raw = fh.read()
+        dims = struct.pack("<4Q", 4, 4, 0xFFFFFFFFFFFFFFFF, 4)
+        assert raw.count(dims) == 1
+        fh.seek(raw.index(dims))
+        fh.write(struct.pack("<Q", 2))
+
     # ---- 17. committed_dtype.h5 ----
     # Tests: committed (shared) datatype — a named datatype that is shared across datasets.
     path = os.path.join(hdf5_dir, "committed_dtype.h5")
@@ -245,6 +302,21 @@ def generate_hdf5_fixtures(base_dir):
         f["my_type"] = dt  # commit the type
         # Reference the committed type
         ds = f.create_dataset("data", data=np.array([1.0, 2.0, 3.0]), dtype=f["my_type"].dtype)
+
+    # ---- 17c. committed_dtype_dataset.h5, committed_dtype_dataset_latest.h5 ----
+    # Tests: datasets whose datatype message is shared: it refers to a committed
+    # (named) datatype, in the earliest and the latest file format.
+    for name, libver in [
+        ("committed_dtype_dataset.h5", "earliest"),
+        ("committed_dtype_dataset_latest.h5", "latest"),
+    ]:
+        path = os.path.join(hdf5_dir, name)
+        print(f"  Generating {path}")
+        with h5py.File(path, "w", libver=libver) as f:
+            f["f8"] = np.dtype("<f8")
+            f.create_dataset("data", data=np.arange(5, dtype=np.float64), dtype=f["f8"])
+            f["i4"] = np.dtype("<i4")
+            f.create_dataset("ints", data=np.array([-1, 0, 1], dtype=np.int32), dtype=f["i4"])
 
     # ---- 17b. external_links.h5 ----
     # Tests: optional external-link resolver across HDF5 files.
@@ -350,6 +422,64 @@ def generate_hdf5_fixtures(base_dir):
                 compression_opts=9
             )
             ds[:] = large
+
+    # ---- 20c. extensible_array_super_blocks.h5 ----
+    # Tests: extensible array chunk indexes that grow past the index block.
+    # libhdf5 creates them with 4 index block elements, 16 elements in the
+    # smallest data block, 4 data block pointers in the smallest secondary
+    # block and 1024-element data block pages. Super block u then holds
+    # 2^(u/2) data blocks of 2^((u+1)/2) * 16 elements: chunks 0-3 live in the
+    # index block, 4-243 in the six data blocks it points to directly (super
+    # blocks 0-3), later chunks behind secondary blocks, and from chunk 131060
+    # (super block 13: 64 data blocks of 2048 elements) the data blocks are
+    # paged, with each page's "initialized" bit in the secondary block.
+    # "data" / "data_gzip": 600 one-row chunks, all written, so every chunk up
+    # to super block 5 is set. "sparse" / "sparse_gzip": 133200 one-element
+    # chunks with fill value -1 and only a few written, among them chunks in
+    # the second page of the first paged data block (132084, 133107) and the
+    # first page of the second one (133108), whose first pages stay unwritten.
+    path = os.path.join(hdf5_dir, "extensible_array_super_blocks.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        data = np.arange(600 * 4, dtype=np.int32).reshape(600, 4)
+        for name, compression in [("data", None), ("data_gzip", "gzip")]:
+            ds = f.create_dataset(
+                name, shape=data.shape, maxshape=(None, 4), dtype=np.int32,
+                chunks=(1, 4), compression=compression
+            )
+            ds[:] = data
+        written = [0, 3, 4, 19, 20, 35, 36, 51, 52, 243, 244, 499, 500, 599,
+                   65524, 132084, 133107, 133108]
+        for name, compression in [("sparse", None), ("sparse_gzip", "gzip")]:
+            ds = f.create_dataset(
+                name, shape=(133200,), maxshape=(None,), dtype=np.int32,
+                chunks=(1,), fillvalue=-1, compression=compression
+            )
+            for i in written:
+                ds[i] = i
+
+    # ---- 20d. extensible_array_max_dims.h5 ----
+    # Tests: libhdf5 numbers extensible array chunks row-major over the chunk
+    # counts at the maximum dimensions, with the unlimited dimension moved to
+    # the front. Each dataset holds int32 np.arange values (fill value -1):
+    # "wider_max" has a fixed dimension whose maximum holds 4 chunks per row
+    # but whose extent holds 2; "wider_max_same_chunks" one whose maximum adds
+    # no chunk; "unlimited_last" and "unlimited_middle" an unlimited dimension
+    # that is not the first.
+    path = os.path.join(hdf5_dir, "extensible_array_max_dims.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        for name, shape, maxshape, chunks in [
+            ("wider_max", (25, 8), (None, 16), (1, 4)),
+            ("wider_max_same_chunks", (50, 7), (None, 8), (1, 4)),
+            ("unlimited_last", (8, 25), (8, None), (4, 1)),
+            ("unlimited_middle", (2, 25, 3), (2, None, 3), (1, 1, 3)),
+        ]:
+            ds = f.create_dataset(
+                name, shape=shape, maxshape=maxshape, chunks=chunks, dtype=np.int32,
+                fillvalue=-1
+            )
+            ds[...] = np.arange(np.prod(shape), dtype=np.int32).reshape(shape)
 
     # ---- 21. btree_v2_chunked.h5 ----
     # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets

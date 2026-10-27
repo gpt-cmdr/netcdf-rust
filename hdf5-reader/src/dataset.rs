@@ -314,6 +314,21 @@ fn decoded_chunk_expected_len(chunk_shape: &[u64], elem_size: usize) -> Result<u
     checked_mul_usize(chunk_elements, elem_size, "decoded chunk byte length")
 }
 
+// HDF5 can retain allocated chunks wholly outside the current logical extent.
+// Ignore only well-formed, grid-aligned stale entries; malformed ranks/alignment
+// remain visible to the existing strict validator. Never inflate an ignored chunk.
+fn clip_stale_chunks(entries: &mut Vec<chunk_index::ChunkEntry>, shape: &[u64], chunks: &[u32]) {
+    entries.retain(|e| {
+        let well_formed = e.offsets.len() == shape.len()
+            && chunks.len() == shape.len()
+            && e.offsets
+                .iter()
+                .zip(chunks)
+                .all(|(&n, &c)| c != 0 && n % u64::from(c) == 0);
+        !(well_formed && e.offsets.iter().zip(shape).any(|(&n, &bound)| n >= bound))
+    });
+}
+
 fn validate_chunk_grid_coverage(
     entries: &mut [chunk_index::ChunkEntry],
     shape: &[u64],
@@ -2088,7 +2103,7 @@ impl Dataset {
             }
         }
 
-        let entries = match chunk_indexing {
+        let mut entries = match chunk_indexing {
             None => {
                 // V1-V3: B-tree v1 chunk indexing
                 self.collect_btree_v1_entries(
@@ -2142,11 +2157,14 @@ impl Dataset {
                     self.offset_size(),
                     self.length_size(),
                     selection.shape,
+                    self.dataspace.max_dims.as_deref(),
                     chunk_dims,
                     selection.chunk_bounds,
                 )
             }
         }?;
+
+        clip_stale_chunks(&mut entries, selection.shape, chunk_dims);
 
         if let Some(key) = cache_key {
             let mut cache = self.chunk_entry_cache.lock();
@@ -4556,6 +4574,24 @@ mod tests {
             size: 0,
             filter_mask: 0,
             offsets: offsets.to_vec(),
+        }
+    }
+
+    #[test]
+    fn stale_chunk_clipping_preserves_strict_malformed_validation() {
+        let mut entries = vec![chunk_entry(&[0, 0], 0x1000), chunk_entry(&[0, 2], 0x2000)];
+        clip_stale_chunks(&mut entries, &[2, 2], &[2, 2]);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            validate_chunk_grid_coverage(&mut entries, &[2, 2], &[2, 2], &[0, 0], &[0, 0]).unwrap()
+        );
+        for offsets in [&[0, 3][..], &[0][..]] {
+            let mut bad = vec![chunk_entry(offsets, 0x3000)];
+            clip_stale_chunks(&mut bad, &[2, 2], &[2, 2]);
+            assert_eq!(bad.len(), 1);
+            assert!(
+                validate_chunk_grid_coverage(&mut bad, &[2, 2], &[2, 2], &[0, 0], &[0, 0]).is_err()
+            );
         }
     }
 

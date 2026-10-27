@@ -38,9 +38,12 @@ pub fn parse(cursor: &mut Cursor<'_>, msg_size: usize) -> Result<DatatypeMessage
     let (dt, size) = parse_datatype_description(cursor)?;
 
     let consumed = (cursor.position() - start) as usize;
-    if consumed < msg_size {
-        cursor.skip(msg_size - consumed)?;
+    if consumed > msg_size {
+        return Err(Error::InvalidData(format!(
+            "datatype description of {consumed} bytes exceeds its {msg_size}-byte message"
+        )));
     }
+    cursor.skip(msg_size - consumed)?;
 
     Ok(DatatypeMessage { datatype: dt, size })
 }
