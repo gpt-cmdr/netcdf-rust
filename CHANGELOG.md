@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## 0.10.0 - 2026-10-26
+
+### Added
+
+- expose exact on-disk datatype encodings for HDF5 datasets and attributes,
+  including attributes stored in dense groups (#108)
+- add chunked row/column gathers, including parallel variants, and uncached
+  full reads; sparse column selections skip unrelated chunk-index entries
+  (#106)
+- add `Group::member_names` and cache old-style group listings so repeated
+  lookups avoid reading and parsing the same group metadata (#107)
+- add builder methods for `OpenOptions` and a configurable per-chunk allocation
+  limit, which defaults to 256 MiB (#104)
+
+### Fixed
+
+- read extensible-array chunk indexes through secondary blocks and paged data
+  blocks, and use maximum dimension sizes when numbering their chunks (#102,
+  #105)
+- read paged fixed-array chunk indexes with the correct page bitmap bit order,
+  checksum offset, and reserved page spacing; sparse files no longer return
+  fill values for initialized chunks
+- handle shared message locations, old-style group soft links, and link
+  resolution across soft and external links (#103)
+- reject malformed HDF5 size, offset, filter, attribute, and chunk metadata
+  with errors instead of overflowing, hanging, or aborting; release in-flight
+  chunk loads if the loader panics (#104, #109)
+- avoid holding the old-style group cache mutex during storage reads (#107)
+
 ## 0.9.3 - 2026-10-20
 
 ### Added

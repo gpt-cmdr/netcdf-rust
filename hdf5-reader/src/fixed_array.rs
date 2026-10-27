@@ -191,6 +191,7 @@ impl FaGeometry {
                 let full = mul(pages - 1, self.run_bytes(per_page)?, "data block size")?;
                 let last = self.run_bytes(self.entries_in_page(pages - 1))?;
                 let len = add(header_len, self.bitmap_bytes(), "data block size")?;
+                let len = add(len, 4, "data block checksum")?;
                 add(add(len, full, "data block size")?, last, "data block size")
             }
         }
@@ -275,17 +276,14 @@ fn parse_data_block(
     // others have undefined addresses that are filtered out later.
     let num_pages = geometry.num_pages();
     let page_bitmap = cursor.read_bytes(geometry.bitmap_bytes())?.to_vec();
+    let _block_checksum = cursor.read_u32_le()?;
 
     let mut all_entries = Vec::with_capacity(geometry.num_entries);
 
     for page_idx in 0..num_pages {
-        let byte_idx = page_idx / 8;
-        let bit_idx = page_idx % 8;
-        let page_initialized =
-            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
         let entries_in_this_page = geometry.entries_in_page(page_idx);
 
-        if page_initialized {
+        if page_is_initialized(&page_bitmap, page_idx) {
             let page_entries = read_entries(
                 &mut cursor,
                 entries_in_this_page,
@@ -298,6 +296,7 @@ fn parse_data_block(
             all_entries.extend(page_entries);
         } else {
             // Uninitialized page — fill with undefined entries.
+            cursor.skip(geometry.run_bytes(entries_in_this_page)?)?;
             all_entries.extend((0..entries_in_this_page).map(|_| FaRawEntry {
                 address: u64::MAX,
                 chunk_size: 0,
@@ -481,18 +480,19 @@ fn page_offsets(
     let mut page_offsets = vec![None; geometry.num_pages()];
     let mut next_page_start = pages_start;
     for (page_idx, page_offset) in page_offsets.iter_mut().enumerate() {
-        let byte_idx = page_idx / 8;
-        let bit_idx = page_idx % 8;
-        let page_initialized =
-            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
-
-        if page_initialized {
+        if page_is_initialized(page_bitmap, page_idx) {
             *page_offset = Some(next_page_start);
-            let page_len = geometry.run_bytes(geometry.entries_in_page(page_idx))?;
-            next_page_start = add_u64(next_page_start, page_len, "page offset")?;
         }
+        let page_len = geometry.run_bytes(geometry.entries_in_page(page_idx))?;
+        next_page_start = add_u64(next_page_start, page_len, "page offset")?;
     }
     Ok(page_offsets)
+}
+
+fn page_is_initialized(bitmap: &[u8], page_idx: usize) -> bool {
+    bitmap
+        .get(page_idx / 8)
+        .is_some_and(|byte| byte & (0x80 >> (page_idx % 8)) != 0)
 }
 
 /// Position of entry `linear_idx`, or `None` for an uninitialized page.
@@ -555,6 +555,7 @@ fn collect_fixed_array_chunk_entries_bounded(
 
     let page_offsets = if geometry.entries_per_page.is_some() {
         let page_bitmap = cursor.read_bytes(geometry.bitmap_bytes())?.to_vec();
+        let _block_checksum = cursor.read_u32_le()?;
         page_offsets(&geometry, &page_bitmap, cursor.position())?
     } else {
         Vec::new()
@@ -624,7 +625,8 @@ fn collect_fixed_array_chunk_entries_bounded_storage(
     let (entries_start, page_offsets) = if geometry.entries_per_page.is_some() {
         let bitmap_bytes = geometry.bitmap_bytes();
         let page_bitmap = storage.read_range(entries_start, bitmap_bytes)?;
-        let pages_start = add_u64(entries_start, bitmap_bytes, "page bitmap")?;
+        let bitmap_and_checksum = add(bitmap_bytes, 4, "page bitmap")?;
+        let pages_start = add_u64(entries_start, bitmap_and_checksum, "page bitmap")?;
         let offsets = page_offsets(&geometry, page_bitmap.as_ref(), pages_start)?;
         (pages_start, offsets)
     } else {
@@ -810,12 +812,22 @@ mod tests {
     fn paged_block_len_matches_the_page_walk() {
         for (num_entries, page_bits) in [(1025u64, 10u8), (2048, 10), (5000, 9), (7, 2)] {
             let geometry = FaGeometry::new(&header(8, page_bits, num_entries), 8).unwrap();
-            let mut walked = 14 + geometry.bitmap_bytes();
+            let mut walked = 14 + geometry.bitmap_bytes() + 4;
             for page in 0..geometry.num_pages() {
                 walked += geometry.entries_in_page(page) * 8 + 4;
             }
             assert_eq!(geometry.block_len(14).unwrap(), walked);
         }
+    }
+
+    #[test]
+    fn page_bitmap_numbers_bits_from_most_significant_to_least() {
+        let geometry = FaGeometry::new(&header(8, 10, 9 * 1024), 8).unwrap();
+        let offsets = page_offsets(&geometry, &[0x81, 0x80], 100).unwrap();
+        assert_eq!(offsets[0], Some(100));
+        assert!(offsets[1..7].iter().all(Option::is_none));
+        assert_eq!(offsets[7], Some(100 + 7 * (1024 * 8 + 4)));
+        assert_eq!(offsets[8], Some(100 + 8 * (1024 * 8 + 4)));
     }
 
     #[test]
