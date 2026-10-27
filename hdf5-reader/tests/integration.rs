@@ -453,6 +453,31 @@ fn external_raw_data_file_requires_resolver() {
 }
 
 #[test]
+fn soft_link_cycles_fail_to_resolve() {
+    let path = skip_if_missing!("soft_link_cycles.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    // "s" -> "/s/x" leads back to "s" through the first component of its
+    // own target; "a" and "b" point at each other.
+    for name in ["/s", "/s/x", "/a", "/b"] {
+        assert!(file.dataset(name).is_err(), "{name}");
+    }
+    let root = file.root_group().unwrap();
+    assert!(root.group("s").is_err());
+
+    let ok: ndarray::ArrayD<i32> = file.dataset("/ok").unwrap().read_array().unwrap();
+    assert_eq!(ok.as_slice().unwrap(), &[0, 1, 2]);
+    let mut names: Vec<String> = root
+        .datasets()
+        .unwrap()
+        .iter()
+        .map(|ds| ds.name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["data", "ok"]);
+}
+
+#[test]
 fn old_format_soft_links() {
     // Symbol table entries of soft links cache the link value instead of an
     // object header address.
@@ -505,6 +530,41 @@ fn old_format_soft_links() {
     names.sort();
     assert_eq!(names, ["inner", "relative"]);
     assert!(group.dataset("dangling").is_err());
+}
+
+#[test]
+fn chunks_larger_than_the_chunk_limit_are_refused() {
+    // 5x10 float32 chunks: 200 bytes each.
+    let path = skip_if_missing!("simple_chunked_deflate.h5");
+    let open = |max_chunk_bytes| {
+        hdf5_reader::Hdf5File::open_with_options(
+            &path,
+            hdf5_reader::OpenOptions {
+                max_chunk_bytes,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+
+    let file = open(199);
+    let err = file
+        .dataset("/temperature")
+        .unwrap()
+        .read_array::<f32>()
+        .unwrap_err();
+    let mut source = &err;
+    while let hdf5_reader::error::Error::Context { source: inner, .. } = source {
+        source = inner;
+    }
+    assert!(
+        matches!(source, hdf5_reader::error::Error::ResourceLimit(_)),
+        "{err}"
+    );
+
+    let file = open(200);
+    let data: ndarray::ArrayD<f32> = file.dataset("/temperature").unwrap().read_array().unwrap();
+    assert_eq!(data.shape(), &[10, 20]);
 }
 
 #[test]

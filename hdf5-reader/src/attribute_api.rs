@@ -96,10 +96,27 @@ impl Attribute {
         T::from_bytes(&self.raw_data, &self.datatype)
     }
 
+    /// Refuse a declared element count the stored payload cannot hold.
+    fn check_payload(&self, n: usize, elem_size: usize) -> Result<()> {
+        let needed = n.checked_mul(elem_size);
+        if n > 0 && (elem_size == 0 || needed.map_or(true, |bytes| bytes > self.raw_data.len())) {
+            return Err(Error::InvalidData(format!(
+                "attribute '{}' declares {n} elements of {elem_size} bytes but holds {} bytes",
+                self.name,
+                self.raw_data.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Read the attribute as a 1-D vector of the given type.
     pub fn read_1d<T: crate::datatype_api::H5Type>(&self) -> Result<Vec<T>> {
         let elem_size = T::element_size(&self.datatype);
         let n = checked_usize(self.num_elements()?, "attribute element count")?;
+        // The dataspace and datatype come from the file: a zero-size datatype
+        // lets the element count reach 2^62 with no data. Size the result
+        // from bytes actually present, never from the declared count alone.
+        self.check_payload(n, elem_size)?;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             let start = i * elem_size;
@@ -252,7 +269,8 @@ impl Attribute {
             } => {
                 let ref_size = 4 + offset_size as usize + 4;
                 let n = checked_usize(self.num_elements()?, "attribute string element count")?;
-                let mut result = Vec::with_capacity(n);
+                // Elements past the payload are not read, so never reserve them.
+                let mut result = Vec::with_capacity(n.min(self.raw_data.len() / ref_size));
                 for i in 0..n {
                     let offset = i * ref_size;
                     if offset + ref_size > self.raw_data.len() {
@@ -293,7 +311,15 @@ impl Attribute {
             } => {
                 let len = *len as usize;
                 let n = checked_usize(self.num_elements()?, "attribute string element count")?;
-                let mut result = Vec::with_capacity(n);
+                if len == 0 && n > 0 {
+                    return Err(Error::InvalidData(format!(
+                        "fixed-length string attribute '{}' has zero width",
+                        self.name
+                    )));
+                }
+                // Elements past the payload are not read, so never reserve them.
+                let mut result =
+                    Vec::with_capacity(n.min(self.raw_data.len().div_ceil(len.max(1))));
                 for i in 0..n {
                     let start = i * len;
                     let end = (start + len).min(self.raw_data.len());
@@ -732,6 +758,36 @@ mod tests {
     use crate::error::ByteOrder;
     use crate::storage::BytesStorage;
     use std::f64::consts::PI;
+
+    #[test]
+    fn element_counts_beyond_the_payload_are_refused() {
+        // 2^40 declared elements, 16 bytes stored: refused before reserving
+        // space for the declared count.
+        let attr = Attribute {
+            name: "huge".to_string(),
+            datatype: Datatype::FloatingPoint {
+                size: 8,
+                byte_order: ByteOrder::LittleEndian,
+            },
+            shape: vec![1 << 40],
+            raw_data: vec![0; 16],
+            decoded_strings: None,
+        };
+        assert!(matches!(attr.read_1d::<f64>(), Err(Error::InvalidData(_))));
+
+        let attr = Attribute {
+            name: "zero_width".to_string(),
+            datatype: Datatype::String {
+                size: StringSize::Fixed(0),
+                encoding: StringEncoding::Ascii,
+                padding: StringPadding::NullPad,
+            },
+            shape: vec![1 << 40],
+            raw_data: Vec::new(),
+            decoded_strings: None,
+        };
+        assert!(matches!(attr.read_strings(), Err(Error::InvalidData(_))));
+    }
 
     #[test]
     fn scalar_f64_attribute() {
