@@ -2157,6 +2157,7 @@ impl Dataset {
                     self.offset_size(),
                     self.length_size(),
                     selection.shape,
+                    self.dataspace.max_dims.as_deref(),
                     chunk_dims,
                     selection.chunk_bounds,
                 )

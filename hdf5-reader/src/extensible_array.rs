@@ -12,6 +12,7 @@ use crate::checksum::jenkins_lookup3;
 use crate::chunk_index::ChunkEntry;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
+use crate::messages::dataspace::UNLIMITED;
 use crate::storage::{Storage, StorageBuffer};
 
 const EAHD_SIGNATURE: [u8; 4] = *b"EAHD";
@@ -697,44 +698,112 @@ fn read_data_block_storage(
     Ok(entries)
 }
 
-fn linear_target_offsets(
-    dataset_shape: &[u64],
-    chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
-) -> Vec<(usize, Vec<u64>)> {
-    let ndim = dataset_shape.len();
-    let chunks_per_dim: Vec<u64> = (0..ndim)
-        .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
-        .collect();
+/// How the chunk index numbers a dataset's chunks (`H5D__earray_idx_get_addr`):
+/// row-major over the chunk counts at the maximum dimensions, with the
+/// unlimited dimension moved to the front.
+struct ChunkNumbering {
+    /// Dimensions in numbering order: the unlimited one, then the others.
+    order: Vec<usize>,
+    /// Weight of each position of `order` in the element index.
+    weights: Vec<u64>,
+    /// Chunk count at the maximum size, per position of `order`.
+    max_counts: Vec<u64>,
+    /// Current chunk count per dimension.
+    counts: Vec<u64>,
+}
 
+impl ChunkNumbering {
+    fn new(dataset_shape: &[u64], chunk_dims: &[u32], max_dims: Option<&[u64]>) -> Self {
+        let ndim = dataset_shape.len();
+        let counts: Vec<u64> = (0..ndim)
+            .map(|dim| dataset_shape[dim].div_ceil(u64::from(chunk_dims[dim])))
+            .collect();
+        let max_dims = max_dims.filter(|max_dims| max_dims.len() == ndim);
+        let unlimited = max_dims
+            .and_then(|max_dims| max_dims.iter().position(|&dim| dim == UNLIMITED))
+            .unwrap_or(0);
+        let order: Vec<usize> = std::iter::once(unlimited)
+            .chain((0..ndim).filter(|&dim| dim != unlimited))
+            .take(ndim)
+            .collect();
+        let max_counts: Vec<u64> = order
+            .iter()
+            .map(|&dim| match max_dims {
+                Some(max_dims) if max_dims[dim] != UNLIMITED => max_dims[dim]
+                    .div_ceil(u64::from(chunk_dims[dim]))
+                    .max(counts[dim]),
+                _ => counts[dim],
+            })
+            .collect();
+        let mut weights = vec![1u64; ndim];
+        for pos in (0..ndim.saturating_sub(1)).rev() {
+            weights[pos] = weights[pos + 1].saturating_mul(max_counts[pos + 1]);
+        }
+        ChunkNumbering {
+            order,
+            weights,
+            max_counts,
+            counts,
+        }
+    }
+
+    /// Element index of the chunk at `chunk_indices` (per dimension).
+    fn index(&self, chunk_indices: &[u64]) -> u64 {
+        self.order
+            .iter()
+            .zip(&self.weights)
+            .fold(0u64, |index, (&dim, &weight)| {
+                index.saturating_add(chunk_indices[dim].saturating_mul(weight))
+            })
+    }
+
+    /// Chunk indices (per dimension) of element `index`, or `None` if that
+    /// chunk lies outside the dataset's current extent.
+    fn chunk_indices(&self, index: u64) -> Option<Vec<u64>> {
+        let mut chunk_indices = vec![0u64; self.order.len()];
+        for (pos, &dim) in self.order.iter().enumerate() {
+            let mut chunk_index = index / self.weights[pos];
+            if pos > 0 {
+                chunk_index %= self.max_counts[pos];
+            }
+            if chunk_index >= self.counts[dim] {
+                return None;
+            }
+            chunk_indices[dim] = chunk_index;
+        }
+        Some(chunk_indices)
+    }
+
+    /// One past the largest element index of a chunk inside the extent.
+    fn end(&self) -> u64 {
+        if self.counts.contains(&0) {
+            return 0;
+        }
+        let last: Vec<u64> = self.counts.iter().map(|count| count - 1).collect();
+        self.index(&last).saturating_add(1)
+    }
+}
+
+fn linear_target_offsets(
+    numbering: &ChunkNumbering,
+    chunk_dims: &[u32],
+    chunk_bounds: (&[u64], &[u64]),
+) -> Vec<(u64, Vec<u64>)> {
+    let ndim = numbering.counts.len();
     if ndim == 0 {
         return vec![(0, Vec::new())];
     }
 
-    let (first_chunk, last_chunk): (Vec<u64>, Vec<u64>) = match chunk_bounds {
-        Some((first, last)) => (first.to_vec(), last.to_vec()),
-        None => (
-            vec![0u64; ndim],
-            chunks_per_dim
-                .iter()
-                .map(|count| count.saturating_sub(1))
-                .collect(),
-        ),
-    };
-
+    let (first_chunk, last_chunk) = chunk_bounds;
     let mut targets = Vec::new();
-    let mut chunk_indices = first_chunk.clone();
+    let mut chunk_indices = first_chunk.to_vec();
     loop {
-        let mut linear_idx = 0u64;
-        for (dim, chunk_index) in chunk_indices.iter().enumerate() {
-            linear_idx = linear_idx * chunks_per_dim[dim] + chunk_index;
-        }
         let offsets = chunk_indices
             .iter()
             .enumerate()
             .map(|(dim, chunk_index)| chunk_index * u64::from(chunk_dims[dim]))
             .collect();
-        targets.push((linear_idx as usize, offsets));
+        targets.push((numbering.index(&chunk_indices), offsets));
 
         let mut advanced = false;
         for dim in (0..ndim).rev() {
@@ -762,12 +831,12 @@ fn collect_extensible_array_chunk_entries_bounded_storage(
     header: &EaHeader,
     sb_layout: &[(u64, u64)],
     params: &EaParams,
-    dataset_shape: &[u64],
+    numbering: &ChunkNumbering,
     chunk_dims: &[u32],
     chunk_bounds: (&[u64], &[u64]),
 ) -> Result<Vec<ChunkEntry>> {
     let offset_size = params.offset_size;
-    let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(chunk_bounds));
+    let targets = linear_target_offsets(numbering, chunk_dims, chunk_bounds);
     let index = read_index_block_storage(storage, header, sb_layout, params)?;
     let (direct_sblks, _) = index_block_direct_blocks(header, sb_layout);
 
@@ -777,12 +846,14 @@ fn collect_extensible_array_chunk_entries_bounded_storage(
 
     for (linear_idx, offsets) in targets {
         let looked_up;
-        let raw = if let Some(raw) = index.inline.get(linear_idx) {
+        let inline = usize::try_from(linear_idx)
+            .ok()
+            .and_then(|idx| index.inline.get(idx));
+        let raw = if let Some(raw) = inline {
             raw
         } else {
             // Element index past the index block's own entries.
-            let mut relative_idx = checked_u64_from_usize(linear_idx, "EA element index")?
-                - u64::from(header.idx_blk_elmts);
+            let mut relative_idx = linear_idx - u64::from(header.idx_blk_elmts);
             let mut sb_idx = None;
             for (candidate_idx, (elmts_per_dblk, num_dblks)) in sb_layout.iter().enumerate() {
                 let capacity = elmts_per_dblk.saturating_mul(*num_dblks);
@@ -921,13 +992,19 @@ impl Storage for SliceStorage<'_> {
 /// Collect chunk entries from an Extensible Array index.
 ///
 /// Walks the EAHD → EAIB → (EADB / EASB → EADB) hierarchy and converts
-/// linear entry indices to multi-dimensional chunk offsets.
+/// linear entry indices to multi-dimensional chunk offsets. `max_dims` are
+/// the dataspace's maximum dimensions: libhdf5 numbers the chunks over them,
+/// with the unlimited dimension first. Without them the current dimensions
+/// are used, which is right only for a first unlimited dimension whose other
+/// dimensions are at their maximum.
+#[allow(clippy::too_many_arguments)]
 pub fn collect_extensible_array_chunk_entries(
     data: &[u8],
     header_address: u64,
     offset_size: u8,
     length_size: u8,
     dataset_shape: &[u64],
+    max_dims: Option<&[u64]>,
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<ChunkEntry>> {
@@ -937,18 +1014,22 @@ pub fn collect_extensible_array_chunk_entries(
         offset_size,
         length_size,
         dataset_shape,
+        max_dims,
         chunk_dims,
         chunk_bounds,
     )
 }
 
-/// Collect chunk entries from an Extensible Array index using random-access storage.
+/// Collect chunk entries from an Extensible Array index using random-access
+/// storage. See [`collect_extensible_array_chunk_entries`].
+#[allow(clippy::too_many_arguments)]
 pub fn collect_extensible_array_chunk_entries_storage(
     storage: &dyn Storage,
     header_address: u64,
     offset_size: u8,
     length_size: u8,
     dataset_shape: &[u64],
+    max_dims: Option<&[u64]>,
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<ChunkEntry>> {
@@ -967,26 +1048,15 @@ pub fn collect_extensible_array_chunk_entries_storage(
         page_nelmts: ea_page_nelmts(header.max_dblk_page_nelmts_bits)?,
     };
 
+    let numbering = ChunkNumbering::new(dataset_shape, chunk_dims, max_dims);
     if let Some(bounds) = chunk_bounds {
         return collect_extensible_array_chunk_entries_bounded_storage(
-            storage,
-            &header,
-            &sb_layout,
-            &params,
-            dataset_shape,
-            chunk_dims,
-            bounds,
+            storage, &header, &sb_layout, &params, &numbering, chunk_dims, bounds,
         );
     }
 
-    let ndim = dataset_shape.len();
-    let chunks_per_dim: Vec<u64> = (0..ndim)
-        .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
-        .collect();
-    // Entries past the dataset's chunks are not read.
-    let num_chunks = chunks_per_dim
-        .iter()
-        .fold(1u64, |count, chunks| count.saturating_mul(*chunks));
+    // Entries past the last chunk inside the extent are not read.
+    let num_chunks = numbering.end();
 
     let index = read_index_block_storage(storage, &header, &sb_layout, &params)?;
     let (direct_sblks, _) = index_block_direct_blocks(&header, &sb_layout);
@@ -1079,13 +1149,16 @@ pub fn collect_extensible_array_chunk_entries_storage(
         if linear_idx >= num_chunks || Cursor::is_undefined_offset(raw.address, offset_size) {
             continue;
         }
-
-        let mut remaining = linear_idx;
-        let mut offsets = vec![0u64; ndim];
-        for d in (0..ndim).rev() {
-            offsets[d] = (remaining % chunks_per_dim[d]) * chunk_dims[d] as u64;
-            remaining /= chunks_per_dim[d];
-        }
+        // Entries of chunks outside the extent (along a dimension below its
+        // maximum) are skipped.
+        let Some(chunk_indices) = numbering.chunk_indices(linear_idx) else {
+            continue;
+        };
+        let offsets = chunk_indices
+            .iter()
+            .enumerate()
+            .map(|(dim, chunk_index)| chunk_index * u64::from(chunk_dims[dim]))
+            .collect();
 
         entries.push(ChunkEntry {
             address: raw.address,
@@ -1317,6 +1390,33 @@ mod tests {
     }
 
     #[test]
+    fn chunk_numbering_follows_libhdf5() {
+        const U: u64 = UNLIMITED;
+        // First unlimited dimension, the other at its maximum: row-major.
+        let n = ChunkNumbering::new(&[5, 8], &[2, 4], Some(&[U, 8]));
+        assert_eq!(n.index(&[2, 1]), 5);
+        assert_eq!(n.end(), 6);
+        // A larger maximum widens every row: 4 chunks per row, 2 in the extent.
+        let n = ChunkNumbering::new(&[5, 8], &[2, 4], Some(&[U, 16]));
+        assert_eq!(n.index(&[1, 1]), 5);
+        assert_eq!(n.chunk_indices(5), Some(vec![1, 1]));
+        assert_eq!(n.chunk_indices(6), None);
+        assert_eq!(n.end(), 10);
+        // Unlimited last: numbered as if it were first.
+        let n = ChunkNumbering::new(&[8, 5], &[4, 2], Some(&[8, U]));
+        assert_eq!(n.index(&[1, 0]), 1);
+        assert_eq!(n.index(&[0, 1]), 2);
+        assert_eq!(n.chunk_indices(5), Some(vec![1, 2]));
+        // Unlimited in the middle of three dimensions.
+        let n = ChunkNumbering::new(&[2, 25, 3], &[1, 1, 3], Some(&[2, U, 3]));
+        assert_eq!(n.index(&[1, 3, 0]), 3 * 2 + 1);
+        assert_eq!(n.end(), 50);
+        // Without maximum dimensions: the current ones, row-major.
+        let n = ChunkNumbering::new(&[5, 8], &[2, 4], None);
+        assert_eq!(n.index(&[2, 1]), 5);
+    }
+
+    #[test]
     fn eahd_bad_signature() {
         let mut data = vec![0u8; 64];
         data[0..4].copy_from_slice(b"XXXX");
@@ -1393,6 +1493,7 @@ mod tests {
             TEST_OFFSET_SIZE,
             TEST_LENGTH_SIZE,
             &[31],
+            None,
             &[1],
             None,
         )
@@ -1405,6 +1506,7 @@ mod tests {
             TEST_OFFSET_SIZE,
             TEST_LENGTH_SIZE,
             &[31],
+            None,
             &[1],
             None,
         )
@@ -1430,6 +1532,7 @@ mod tests {
                 TEST_OFFSET_SIZE,
                 TEST_LENGTH_SIZE,
                 &[31],
+                None,
                 &[1],
                 Some(bounds),
             )
@@ -1442,6 +1545,7 @@ mod tests {
                 TEST_OFFSET_SIZE,
                 TEST_LENGTH_SIZE,
                 &[31],
+                None,
                 &[1],
                 Some(bounds),
             )
@@ -1462,6 +1566,7 @@ mod tests {
             TEST_OFFSET_SIZE,
             TEST_LENGTH_SIZE,
             &[9],
+            None,
             &[1],
             None,
         )
@@ -1492,6 +1597,7 @@ mod tests {
             TEST_OFFSET_SIZE,
             TEST_LENGTH_SIZE,
             &[31],
+            None,
             &[1],
             None,
         )
@@ -1517,6 +1623,7 @@ mod tests {
             TEST_OFFSET_SIZE,
             TEST_LENGTH_SIZE,
             &[31],
+            None,
             &[1],
             Some((&[8], &[8])),
         )

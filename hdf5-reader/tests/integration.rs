@@ -861,6 +861,49 @@ fn extensible_array_chunks_beyond_the_index_block() {
 }
 
 #[test]
+fn extensible_array_chunks_numbered_by_the_maximum_dimensions() {
+    // Values are 0, 1, 2, ... in each dataset's shape; see generate_fixtures.py.
+    let path = skip_if_missing!("extensible_array_max_dims.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    for name in [
+        "wider_max",
+        "wider_max_same_chunks",
+        "unlimited_last",
+        "unlimited_middle",
+    ] {
+        let ds = file.dataset(name).unwrap();
+        let shape = ds.shape().to_vec();
+        let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+        for (i, v) in data.iter().enumerate() {
+            assert_eq!(*v, i as i32, "{name} element {i}");
+        }
+
+        // The second half of the first dimension.
+        let first = shape[0] / 2;
+        let selection = hdf5_reader::SliceInfo {
+            selections: shape
+                .iter()
+                .enumerate()
+                .map(|(dim, &len)| hdf5_reader::SliceInfoElem::Slice {
+                    start: if dim == 0 { first } else { 0 },
+                    end: len,
+                    step: 1,
+                })
+                .collect(),
+        };
+        let slice: ndarray::ArrayD<i32> = ds.read_slice(&selection).unwrap();
+        let row_len: u64 = shape[1..].iter().product();
+        for (i, v) in slice.iter().enumerate() {
+            assert_eq!(
+                *v,
+                (first * row_len) as i32 + i as i32,
+                "{name} slice element {i}"
+            );
+        }
+    }
+}
+
+#[test]
 fn filtered_chunk_size_fields_of_three_and_five_bytes() {
     // libhdf5 writes the chunk-size field of fixed array, extensible array and v2
     // B-tree entries 1 + (log2(chunk bytes) + 8) / 8 bytes wide: 3 bytes for the

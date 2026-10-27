@@ -445,6 +445,29 @@ def generate_hdf5_fixtures(base_dir):
             for i in written:
                 ds[i] = i
 
+    # ---- 20d. extensible_array_max_dims.h5 ----
+    # Tests: libhdf5 numbers extensible array chunks row-major over the chunk
+    # counts at the maximum dimensions, with the unlimited dimension moved to
+    # the front. Each dataset holds int32 np.arange values (fill value -1):
+    # "wider_max" has a fixed dimension whose maximum holds 4 chunks per row
+    # but whose extent holds 2; "wider_max_same_chunks" one whose maximum adds
+    # no chunk; "unlimited_last" and "unlimited_middle" an unlimited dimension
+    # that is not the first.
+    path = os.path.join(hdf5_dir, "extensible_array_max_dims.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        for name, shape, maxshape, chunks in [
+            ("wider_max", (25, 8), (None, 16), (1, 4)),
+            ("wider_max_same_chunks", (50, 7), (None, 8), (1, 4)),
+            ("unlimited_last", (8, 25), (8, None), (4, 1)),
+            ("unlimited_middle", (2, 25, 3), (2, None, 3), (1, 1, 3)),
+        ]:
+            ds = f.create_dataset(
+                name, shape=shape, maxshape=maxshape, chunks=chunks, dtype=np.int32,
+                fillvalue=-1
+            )
+            ds[...] = np.arange(np.prod(shape), dtype=np.int32).reshape(shape)
+
     # ---- 21. btree_v2_chunked.h5 ----
     # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets
     # with more than one unlimited dimension when libver='latest'.
