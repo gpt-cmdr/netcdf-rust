@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.10.1 - 2026-10-28
+
+### Improved
+
+- look up only selected row and column chunks for chunked HDF5 gathers,
+  including v1 and v2 B-tree indexes. Sparse selections avoid walking
+  unrelated B-tree branches and intervening row chunks (#111)
+
 ## 0.10.0 - 2026-10-26
 
 ### Added
