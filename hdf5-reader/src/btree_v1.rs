@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 
+use crate::chunk_index::ChunkSet;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
 use crate::storage::Storage;
@@ -223,6 +224,40 @@ pub fn collect_btree_v1_leaves_storage(
             ndims,
             chunk_dims,
             chunk_bounds,
+            chunk_set: None,
+        },
+        root_address,
+        MAX_BTREE_V1_RECURSION_DEPTH,
+        &mut visited,
+        &mut results,
+    )?;
+    Ok(results)
+}
+
+/// Walk a v1 chunk B-tree from random-access storage and collect the leaf
+/// entries of the chunks in `set`, entering only the nodes whose key range
+/// may hold a selected chunk (child `i` of a node holds the chunks from key
+/// `i` up to key `i + 1`, as libhdf5's lookups assume).
+pub(crate) fn collect_btree_v1_chunk_leaves_in_set_storage(
+    storage: &dyn Storage,
+    root_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    ndims: u32,
+    chunk_dims: &[u32],
+    set: &ChunkSet,
+) -> Result<Vec<(BTreeV1Key, u64)>> {
+    let mut results = Vec::new();
+    let mut visited = HashSet::new();
+    collect_recursive_storage(
+        BTreeV1CollectContextStorage {
+            storage,
+            offset_size,
+            length_size,
+            ndims: Some(ndims),
+            chunk_dims,
+            chunk_bounds: None,
+            chunk_set: Some(set),
         },
         root_address,
         MAX_BTREE_V1_RECURSION_DEPTH,
@@ -250,6 +285,7 @@ struct BTreeV1CollectContextStorage<'a> {
     ndims: Option<u32>,
     chunk_dims: &'a [u32],
     chunk_bounds: Option<(&'a [u64], &'a [u64])>,
+    chunk_set: Option<&'a ChunkSet>,
 }
 
 /// Recursive helper for tree traversal.
@@ -402,17 +438,38 @@ fn collect_recursive_storage(
                 _ => true,
             };
 
-            if include {
+            let selected = match (&node.keys[i], context.chunk_set) {
+                (BTreeV1Key::RawData { offsets, .. }, Some(set)) => {
+                    set.contains_offsets(offsets, context.chunk_dims)
+                }
+                _ => true,
+            };
+
+            if include && selected {
                 results.push((node.keys[i].clone(), *child_addr));
             }
         }
     } else {
-        for child_addr in &node.children {
+        for (i, child_addr) in node.children.iter().enumerate() {
+            if let Some(set) = context.chunk_set {
+                let low = raw_data_key_offsets(node.keys.get(i));
+                let high = raw_data_key_offsets(node.keys.get(i + 1));
+                if !set.may_contain_between(low, high, context.chunk_dims) {
+                    continue;
+                }
+            }
             collect_recursive_storage(context, *child_addr, depth_remaining - 1, visited, results)?;
         }
     }
 
     Ok(())
+}
+
+fn raw_data_key_offsets(key: Option<&BTreeV1Key>) -> Option<&[u64]> {
+    match key {
+        Some(BTreeV1Key::RawData { offsets, .. }) => Some(offsets),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

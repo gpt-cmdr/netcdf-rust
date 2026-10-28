@@ -9,7 +9,7 @@
 //! - `EASB` — Extensible Array Secondary Block
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunk_index::ChunkEntry;
+use crate::chunk_index::{ChunkEntry, ChunkSet};
 use crate::error::{Error, Result};
 use crate::io::Cursor;
 use crate::messages::dataspace::UNLIMITED;
@@ -825,18 +825,15 @@ fn linear_target_offsets(
     targets
 }
 
-/// Look up the entries of the chunks in `chunk_bounds`.
-fn collect_extensible_array_chunk_entries_bounded_storage(
+/// Look up the entries at `targets` (element index, chunk offsets).
+fn collect_extensible_array_chunk_entries_at_storage(
     storage: &dyn Storage,
     header: &EaHeader,
     sb_layout: &[(u64, u64)],
     params: &EaParams,
-    numbering: &ChunkNumbering,
-    chunk_dims: &[u32],
-    chunk_bounds: (&[u64], &[u64]),
+    targets: Vec<(u64, Vec<u64>)>,
 ) -> Result<Vec<ChunkEntry>> {
     let offset_size = params.offset_size;
-    let targets = linear_target_offsets(numbering, chunk_dims, chunk_bounds);
     let index = read_index_block_storage(storage, header, sb_layout, params)?;
     let (direct_sblks, _) = index_block_direct_blocks(header, sb_layout);
 
@@ -1020,6 +1017,56 @@ pub fn collect_extensible_array_chunk_entries(
     )
 }
 
+/// Collect the entries of the chunks in `set` from an Extensible Array
+/// index, reading only the blocks that hold their entries.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_extensible_array_chunk_entries_in_set_storage(
+    storage: &dyn Storage,
+    header_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    dataset_shape: &[u64],
+    max_dims: Option<&[u64]>,
+    chunk_dims: &[u32],
+    set: &ChunkSet,
+) -> Result<Vec<ChunkEntry>> {
+    let header = parse_header_storage(storage, header_address, offset_size, length_size)?;
+    if Cursor::is_undefined_offset(header.index_block_address, offset_size)
+        || set.rank() != dataset_shape.len()
+    {
+        return Ok(Vec::new());
+    }
+    let sb_layout = compute_super_block_layout(&header)?;
+    let params = EaParams {
+        is_filtered: header.client_id == 1,
+        offset_size,
+        entry_size: header.element_size,
+        sizeof_nelmts: usize::from(header.max_nelmts_bits).div_ceil(8),
+        page_nelmts: ea_page_nelmts(header.max_dblk_page_nelmts_bits)?,
+    };
+    let numbering = ChunkNumbering::new(dataset_shape, chunk_dims, max_dims);
+    let targets = set
+        .chunks()
+        .filter(|chunk_indices| {
+            chunk_indices
+                .iter()
+                .zip(&numbering.counts)
+                .all(|(index, count)| index < count)
+        })
+        .map(|chunk_indices| {
+            let offsets = chunk_indices
+                .iter()
+                .zip(chunk_dims)
+                .map(|(&index, &chunk)| index * u64::from(chunk))
+                .collect();
+            (numbering.index(&chunk_indices), offsets)
+        })
+        .collect();
+    collect_extensible_array_chunk_entries_at_storage(
+        storage, &header, &sb_layout, &params, targets,
+    )
+}
+
 /// Collect chunk entries from an Extensible Array index using random-access
 /// storage. See [`collect_extensible_array_chunk_entries`].
 #[allow(clippy::too_many_arguments)]
@@ -1050,8 +1097,9 @@ pub fn collect_extensible_array_chunk_entries_storage(
 
     let numbering = ChunkNumbering::new(dataset_shape, chunk_dims, max_dims);
     if let Some(bounds) = chunk_bounds {
-        return collect_extensible_array_chunk_entries_bounded_storage(
-            storage, &header, &sb_layout, &params, &numbering, chunk_dims, bounds,
+        let targets = linear_target_offsets(&numbering, chunk_dims, bounds);
+        return collect_extensible_array_chunk_entries_at_storage(
+            storage, &header, &sb_layout, &params, targets,
         );
     }
 

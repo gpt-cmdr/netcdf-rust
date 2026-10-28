@@ -319,6 +319,36 @@ fn decoded_chunk_expected_len(chunk_shape: &[u64], elem_size: usize) -> Result<u
     checked_mul_usize(chunk_elements, elem_size, "decoded chunk byte length")
 }
 
+/// Chunk entries from the leaf keys of a v1 chunk B-tree.
+fn btree_v1_chunk_entries(
+    leaves: &[(crate::btree_v1::BTreeV1Key, u64)],
+    ndim: usize,
+) -> Result<Vec<chunk_index::ChunkEntry>> {
+    let mut entries = Vec::with_capacity(leaves.len());
+    for (key, chunk_addr) in leaves {
+        match key {
+            crate::btree_v1::BTreeV1Key::RawData {
+                chunk_size,
+                filter_mask,
+                offsets,
+            } => {
+                entries.push(chunk_index::ChunkEntry {
+                    address: *chunk_addr,
+                    size: *chunk_size as u64,
+                    filter_mask: *filter_mask,
+                    offsets: offsets[..ndim].to_vec(),
+                });
+            }
+            _ => {
+                return Err(Error::InvalidData(
+                    "expected raw data key in chunk B-tree".into(),
+                ))
+            }
+        }
+    }
+    Ok(entries)
+}
+
 // HDF5 can retain allocated chunks wholly outside the current logical extent.
 // Ignore only well-formed, grid-aligned stale entries; malformed ranks/alignment
 // remain visible to the existing strict validator. Never inflate an ignored chunk.
@@ -2243,29 +2273,89 @@ impl Dataset {
             chunk_dims,
             chunk_bounds,
         )?;
+        btree_v1_chunk_entries(&leaves, ndim)
+    }
 
-        let mut entries = Vec::with_capacity(leaves.len());
-        for (key, chunk_addr) in &leaves {
-            match key {
-                crate::btree_v1::BTreeV1Key::RawData {
-                    chunk_size,
-                    filter_mask,
-                    offsets,
-                } => {
-                    entries.push(chunk_index::ChunkEntry {
-                        address: *chunk_addr,
-                        size: *chunk_size as u64,
-                        filter_mask: *filter_mask,
-                        offsets: offsets[..ndim].to_vec(),
-                    });
-                }
-                _ => {
-                    return Err(Error::InvalidData(
-                        "expected raw data key in chunk B-tree".into(),
-                    ))
-                }
+    /// Collect the entries of the chunks in `set`, looking up only those
+    /// chunks (B-trees enter only the nodes whose key range may hold one), so
+    /// the work scales with the number of selected chunks rather than the
+    /// span between them. Stale chunks are dropped as in
+    /// [`Dataset::collect_chunk_entries`]; the result is not cached.
+    fn collect_chunk_entries_in_set(
+        &self,
+        index_address: u64,
+        chunk_dims: &[u32],
+        chunk_indexing: Option<&ChunkIndexing>,
+        shape: &[u64],
+        elem_size: usize,
+        set: &chunk_index::ChunkSet,
+    ) -> Result<Vec<chunk_index::ChunkEntry>> {
+        let storage = self.context.storage.as_ref();
+        let ndim = shape.len();
+        let mut entries = match chunk_indexing {
+            None => btree_v1_chunk_entries(
+                &crate::btree_v1::collect_btree_v1_chunk_leaves_in_set_storage(
+                    storage,
+                    index_address,
+                    self.offset_size(),
+                    self.length_size(),
+                    ndim as u32,
+                    chunk_dims,
+                    set,
+                )?,
+                ndim,
+            ),
+            Some(ChunkIndexing::SingleChunk {
+                filtered_size,
+                filters,
+            }) => Ok(vec![chunk_index::single_chunk_entry(
+                index_address,
+                *filtered_size,
+                *filters,
+                ndim,
+            )]),
+            Some(ChunkIndexing::BTreeV2) => chunk_index::collect_v2_chunk_entries_in_set_storage(
+                storage,
+                index_address,
+                self.offset_size(),
+                self.length_size(),
+                ndim as u32,
+                chunk_dims,
+                set,
+            ),
+            Some(ChunkIndexing::Implicit) => chunk_index::collect_implicit_chunk_entries_in_set(
+                index_address,
+                shape,
+                chunk_dims,
+                elem_size,
+                set,
+            ),
+            Some(ChunkIndexing::FixedArray { .. }) => {
+                crate::fixed_array::collect_fixed_array_chunk_entries_in_set_storage(
+                    storage,
+                    index_address,
+                    self.offset_size(),
+                    self.length_size(),
+                    shape,
+                    chunk_dims,
+                    set,
+                )
             }
-        }
+            Some(ChunkIndexing::ExtensibleArray { .. }) => {
+                crate::extensible_array::collect_extensible_array_chunk_entries_in_set_storage(
+                    storage,
+                    index_address,
+                    self.offset_size(),
+                    self.length_size(),
+                    shape,
+                    self.dataspace.max_dims.as_deref(),
+                    chunk_dims,
+                    set,
+                )
+            }
+        }?;
+        clip_stale_chunks(&mut entries, shape, chunk_dims);
+        entries.retain(|entry| set.contains_offsets(&entry.offsets, chunk_dims));
         Ok(entries)
     }
 
@@ -2273,8 +2363,8 @@ impl Dataset {
     /// dataset, as a `rows x columns.len()` array.
     ///
     /// `rows` is `(start, end, step)` with `end` exclusive; `columns` may be in
-    /// any order and repeat. The chunk index is queried once per contiguous
-    /// run of selected column chunks, and each chunk is decoded at most once,
+    /// any order and repeat. The chunk index is queried once, for the chunks
+    /// holding selected elements only, and each chunk is decoded at most once,
     /// copying only the selected elements. A few columns of a wide dataset
     /// can be read without materializing the full row range. Returns `Ok(None)`
     /// for datasets that are not 2-D and chunked; read those with
@@ -2359,43 +2449,34 @@ impl Dataset {
         let first_row = rows.0 / chunk_shape[0];
         let last_selected = rows.0 + ((rows.1 - rows.0 - 1) / rows.2) * rows.2;
         let last_row = last_selected / chunk_shape[0];
-        // A single min..max query can enumerate every unselected chunk between
-        // two distant columns. Coalesce adjacent selected chunks, then query
-        // each run without crossing the gaps.
-        let mut runs: Vec<(u64, u64)> = Vec::new();
-        for &col in groups.keys() {
-            if let Some((_, end)) = runs.last_mut() {
-                if end.checked_add(1) == Some(col) {
-                    *end = col;
-                    continue;
-                }
-            }
-            runs.push((col, col));
-        }
+        // The row chunks holding a selected row: all of them when the step
+        // is at most the chunk height, else the chunk of each selected row.
+        let row_chunks: Vec<u64> = if rows.2 <= chunk_shape[0] {
+            (first_row..=last_row).collect()
+        } else {
+            (0..nr as u64)
+                .map(|i| (rows.0 + i * rows.2) / chunk_shape[0])
+                .collect()
+        };
+        // Look up the selected chunks only, in one index query: the work
+        // scales with the number of selected chunks, not with the span
+        // between them, for every chunk index type.
+        let set = chunk_index::ChunkSet::new(vec![row_chunks, groups.keys().copied().collect()]);
+        let entries = self.collect_chunk_entries_in_set(
+            *address,
+            dims,
+            chunk_indexing.as_ref(),
+            shape,
+            elem_size,
+            &set,
+        )?;
         let mut by_column = std::collections::BTreeMap::<u64, Vec<chunk_index::ChunkEntry>>::new();
-        for (first_col, last_col) in runs {
-            let first = [first_row, first_col];
-            let last = [last_row, last_col];
-            let entries = self.collect_chunk_entries(
-                *address,
-                dims,
-                chunk_indexing.as_ref(),
-                ChunkEntrySelection {
-                    shape,
-                    ndim: 2,
-                    elem_size,
-                    chunk_bounds: Some((&first, &last)),
-                },
-            )?;
-            for entry in entries {
-                if entry.offsets.len() != 2 {
-                    return Err(Error::InvalidData("chunk rank mismatch".into()));
-                }
-                let col = entry.offsets[1] / chunk_shape[1];
-                if groups.contains_key(&col) {
-                    by_column.entry(col).or_default().push(entry);
-                }
+        for entry in entries {
+            if entry.offsets.len() != 2 {
+                return Err(Error::InvalidData("chunk rank mismatch".into()));
             }
+            let col = entry.offsets[1] / chunk_shape[1];
+            by_column.entry(col).or_default().push(entry);
         }
         for (column_chunk, selected) in groups {
             let first = [first_row, column_chunk];

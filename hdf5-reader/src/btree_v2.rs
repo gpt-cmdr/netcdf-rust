@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 use crate::checksum::jenkins_lookup3;
+use crate::chunk_index::ChunkQuery;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
 use crate::storage::Storage;
@@ -458,25 +459,46 @@ fn read_scaled_chunk_offsets(
     Ok(offsets)
 }
 
-fn record_matches_chunk_bounds(
+fn record_chunk_offsets(record: &BTreeV2Record) -> Option<&[u64]> {
+    match record {
+        BTreeV2Record::ChunkedNonFiltered { offsets, .. }
+        | BTreeV2Record::ChunkedFiltered { offsets, .. } => Some(offsets),
+        _ => None,
+    }
+}
+
+fn record_matches_chunks(
     record: &BTreeV2Record,
     chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
+    chunks: ChunkQuery<'_>,
 ) -> bool {
-    let Some((first_chunk, last_chunk)) = chunk_bounds else {
+    record_chunk_offsets(record).map_or(true, |offsets| chunks.matches(offsets, chunk_dims))
+}
+
+/// Whether child `child_index` of an internal node, whose records lie between
+/// the node's records `child_index - 1` and `child_index`, may hold a chunk
+/// the query collects.
+fn child_may_match_chunks(
+    records: &[BTreeV2Record],
+    child_index: usize,
+    chunk_dims: &[u32],
+    chunks: ChunkQuery<'_>,
+) -> bool {
+    if chunks.set.is_none() {
         return true;
+    }
+    let bound = |index: usize| records.get(index).map(record_chunk_offsets);
+    let low = match child_index.checked_sub(1).map(bound) {
+        Some(Some(None)) => return true,
+        Some(Some(Some(offsets))) => Some(offsets),
+        _ => None,
     };
-
-    let offsets = match record {
-        BTreeV2Record::ChunkedNonFiltered { offsets, .. }
-        | BTreeV2Record::ChunkedFiltered { offsets, .. } => offsets,
-        _ => return true,
+    let high = match bound(child_index) {
+        Some(None) => return true,
+        Some(Some(offsets)) => Some(offsets),
+        None => None,
     };
-
-    offsets.iter().enumerate().all(|(dim, offset)| {
-        let chunk_index = *offset / u64::from(chunk_dims[dim]);
-        chunk_index >= first_chunk[dim] && chunk_index <= last_chunk[dim]
-    })
+    chunks.may_contain_between(low, high, chunk_dims)
 }
 
 fn record_matches_link_name_hash(record: &BTreeV2Record, target_hash: Option<u32>) -> bool {
@@ -491,11 +513,11 @@ fn record_matches_link_name_hash(record: &BTreeV2Record, target_hash: Option<u32
 fn record_matches_query(
     record: &BTreeV2Record,
     chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
+    chunks: ChunkQuery<'_>,
     link_name_hash: Option<u32>,
 ) -> bool {
     record_matches_link_name_hash(record, link_name_hash)
-        && record_matches_chunk_bounds(record, chunk_dims, chunk_bounds)
+        && record_matches_chunks(record, chunk_dims, chunks)
 }
 
 fn link_name_hash(record: &BTreeV2Record) -> Option<u32> {
@@ -672,7 +694,7 @@ fn parse_leaf_node(
     length_size: u8,
     ndims: Option<u32>,
     chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
+    chunks: ChunkQuery<'_>,
     link_name_hash: Option<u32>,
     num_records: u16,
     heap_id_len: usize,
@@ -711,7 +733,7 @@ fn parse_leaf_node(
             chunk_dims,
             heap_id_len,
         )?;
-        if record_matches_query(&record, chunk_dims, chunk_bounds, link_name_hash) {
+        if record_matches_query(&record, chunk_dims, chunks, link_name_hash) {
             records.push(record);
         }
     }
@@ -737,7 +759,7 @@ fn parse_internal_node(
     length_size: u8,
     ndims: Option<u32>,
     chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
+    chunks: ChunkQuery<'_>,
     link_name_hash: Option<u32>,
     num_records: u16,
     depth: u16,
@@ -864,6 +886,7 @@ fn parse_internal_node(
         let child_addr = child_addresses[i];
         if !Cursor::is_undefined_offset(child_addr, offset_size)
             && child_may_match_link_name_hash(&node_records, i, link_name_hash)
+            && child_may_match_chunks(&node_records, i, chunk_dims, chunks)
         {
             let child_nrec = child_nrecords[i];
             if child_depth == 0 {
@@ -877,7 +900,7 @@ fn parse_internal_node(
                     length_size,
                     ndims,
                     chunk_dims,
-                    chunk_bounds,
+                    chunks,
                     link_name_hash,
                     child_nrec,
                     heap_id_len,
@@ -892,7 +915,7 @@ fn parse_internal_node(
                     length_size,
                     ndims,
                     chunk_dims,
-                    chunk_bounds,
+                    chunks,
                     link_name_hash,
                     child_nrec,
                     child_depth,
@@ -903,7 +926,7 @@ fn parse_internal_node(
             }
         }
 
-        if record_matches_query(record, chunk_dims, chunk_bounds, link_name_hash) {
+        if record_matches_query(record, chunk_dims, chunks, link_name_hash) {
             records.push(record.clone());
         }
     }
@@ -912,6 +935,7 @@ fn parse_internal_node(
     let final_child_addr = child_addresses[final_child_index];
     if !Cursor::is_undefined_offset(final_child_addr, offset_size)
         && child_may_match_link_name_hash(&node_records, final_child_index, link_name_hash)
+        && child_may_match_chunks(&node_records, final_child_index, chunk_dims, chunks)
     {
         let child_nrec = child_nrecords[final_child_index];
         if child_depth == 0 {
@@ -925,7 +949,7 @@ fn parse_internal_node(
                 length_size,
                 ndims,
                 chunk_dims,
-                chunk_bounds,
+                chunks,
                 link_name_hash,
                 child_nrec,
                 heap_id_len,
@@ -940,7 +964,7 @@ fn parse_internal_node(
                 length_size,
                 ndims,
                 chunk_dims,
-                chunk_bounds,
+                chunks,
                 link_name_hash,
                 child_nrec,
                 child_depth,
@@ -978,7 +1002,10 @@ pub fn collect_btree_v2_records(
         length_size,
         ndims,
         chunk_dims,
-        chunk_bounds,
+        ChunkQuery {
+            bounds: chunk_bounds,
+            set: None,
+        },
         None,
     )
 }
@@ -991,7 +1018,7 @@ fn collect_btree_v2_records_with_link_hash(
     length_size: u8,
     ndims: Option<u32>,
     chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
+    chunks: ChunkQuery<'_>,
     link_name_hash: Option<u32>,
 ) -> Result<Vec<BTreeV2Record>> {
     if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
@@ -1021,7 +1048,7 @@ fn collect_btree_v2_records_with_link_hash(
             length_size,
             ndims,
             chunk_dims,
-            chunk_bounds,
+            chunks,
             link_name_hash,
             header.num_records_in_root,
             heap_id_len,
@@ -1037,7 +1064,7 @@ fn collect_btree_v2_records_with_link_hash(
             length_size,
             ndims,
             chunk_dims,
-            chunk_bounds,
+            chunks,
             link_name_hash,
             header.num_records_in_root,
             header.depth,
@@ -1066,8 +1093,31 @@ pub(crate) fn collect_btree_v2_link_name_hash_records(
         length_size,
         None,
         &[],
-        None,
+        ChunkQuery::default(),
         Some(target_hash),
+    )
+}
+
+/// Collect the records of a B-tree v2 from random-access storage, skipping
+/// children that cannot hold a chunk `query` collects.
+pub(crate) fn collect_btree_v2_records_query_storage(
+    storage: &dyn Storage,
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
+    query: ChunkQuery<'_>,
+) -> Result<Vec<BTreeV2Record>> {
+    collect_btree_v2_records_storage_with_link_hash(
+        storage,
+        header,
+        offset_size,
+        length_size,
+        ndims,
+        chunk_dims,
+        query,
+        None,
     )
 }
 
@@ -1088,7 +1138,10 @@ pub fn collect_btree_v2_records_storage(
         length_size,
         ndims,
         chunk_dims,
-        chunk_bounds,
+        ChunkQuery {
+            bounds: chunk_bounds,
+            set: None,
+        },
         None,
     )
 }
@@ -1101,7 +1154,7 @@ fn collect_btree_v2_records_storage_with_link_hash(
     length_size: u8,
     ndims: Option<u32>,
     chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
+    chunks: ChunkQuery<'_>,
     link_name_hash: Option<u32>,
 ) -> Result<Vec<BTreeV2Record>> {
     if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
@@ -1127,7 +1180,7 @@ fn collect_btree_v2_records_storage_with_link_hash(
             length_size,
             ndims,
             chunk_dims,
-            chunk_bounds,
+            chunks,
             link_name_hash,
             header.num_records_in_root,
             heap_id_len,
@@ -1142,7 +1195,7 @@ fn collect_btree_v2_records_storage_with_link_hash(
             length_size,
             ndims,
             chunk_dims,
-            chunk_bounds,
+            chunks,
             link_name_hash,
             header.num_records_in_root,
             header.depth,
@@ -1170,7 +1223,7 @@ pub(crate) fn collect_btree_v2_link_name_hash_records_storage(
         length_size,
         None,
         &[],
-        None,
+        ChunkQuery::default(),
         Some(target_hash),
     )
 }
@@ -1184,7 +1237,7 @@ fn parse_leaf_node_storage(
     length_size: u8,
     ndims: Option<u32>,
     chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
+    chunks: ChunkQuery<'_>,
     link_name_hash: Option<u32>,
     num_records: u16,
     heap_id_len: usize,
@@ -1202,7 +1255,7 @@ fn parse_leaf_node_storage(
         length_size,
         ndims,
         chunk_dims,
-        chunk_bounds,
+        chunks,
         link_name_hash,
         num_records,
         heap_id_len,
@@ -1219,7 +1272,7 @@ fn parse_internal_node_storage(
     length_size: u8,
     ndims: Option<u32>,
     chunk_dims: &[u32],
-    chunk_bounds: Option<(&[u64], &[u64])>,
+    chunks: ChunkQuery<'_>,
     link_name_hash: Option<u32>,
     num_records: u16,
     depth: u16,
@@ -1321,6 +1374,7 @@ fn parse_internal_node_storage(
         let child_addr = child_addresses[i];
         if !Cursor::is_undefined_offset(child_addr, offset_size)
             && child_may_match_link_name_hash(&node_records, i, link_name_hash)
+            && child_may_match_chunks(&node_records, i, chunk_dims, chunks)
         {
             let child_nrec = child_nrecords[i];
             if child_depth == 0 {
@@ -1333,7 +1387,7 @@ fn parse_internal_node_storage(
                     length_size,
                     ndims,
                     chunk_dims,
-                    chunk_bounds,
+                    chunks,
                     link_name_hash,
                     child_nrec,
                     heap_id_len,
@@ -1348,7 +1402,7 @@ fn parse_internal_node_storage(
                     length_size,
                     ndims,
                     chunk_dims,
-                    chunk_bounds,
+                    chunks,
                     link_name_hash,
                     child_nrec,
                     child_depth,
@@ -1359,7 +1413,7 @@ fn parse_internal_node_storage(
             }
         }
 
-        if record_matches_query(record, chunk_dims, chunk_bounds, link_name_hash) {
+        if record_matches_query(record, chunk_dims, chunks, link_name_hash) {
             records.push(record.clone());
         }
     }
@@ -1368,6 +1422,7 @@ fn parse_internal_node_storage(
     let final_child_addr = child_addresses[final_child_index];
     if !Cursor::is_undefined_offset(final_child_addr, offset_size)
         && child_may_match_link_name_hash(&node_records, final_child_index, link_name_hash)
+        && child_may_match_chunks(&node_records, final_child_index, chunk_dims, chunks)
     {
         let child_nrec = child_nrecords[final_child_index];
         if child_depth == 0 {
@@ -1380,7 +1435,7 @@ fn parse_internal_node_storage(
                 length_size,
                 ndims,
                 chunk_dims,
-                chunk_bounds,
+                chunks,
                 link_name_hash,
                 child_nrec,
                 heap_id_len,
@@ -1395,7 +1450,7 @@ fn parse_internal_node_storage(
                 length_size,
                 ndims,
                 chunk_dims,
-                chunk_bounds,
+                chunks,
                 link_name_hash,
                 child_nrec,
                 child_depth,
@@ -1827,7 +1882,7 @@ mod tests {
             8,
             None,
             &[],
-            None,
+            ChunkQuery::default(),
             None,
             2,
             8, // heap_id_len
