@@ -85,6 +85,22 @@ pub const DEFAULT_MAX_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 /// Largest decoded chunk the HDF5 format permits (chunk sizes are 32-bit).
 pub const HDF5_MAX_CHUNK_BYTES: usize = u32::MAX as usize;
 
+/// Default largest decoded selection one dataset read will allocate:
+/// unlimited.
+///
+/// A dataset's extent comes from the file, so callers reading untrusted files
+/// should set [`OpenOptions::max_read_bytes`] to what they can afford.
+pub const DEFAULT_MAX_READ_BYTES: usize = usize::MAX;
+
+/// Default largest object header, across all of its chunks, the reader will
+/// read: 64 MiB.
+///
+/// Real object headers are a few KiB; each message is at most 64 KiB and
+/// attributes past a handful move to dense storage outside the header. The
+/// bound applies before each header chunk is read, so continuation chunks
+/// that overlap or repeat cannot multiply the bytes parsed for one object.
+pub const DEFAULT_MAX_OBJECT_HEADER_BYTES: usize = 64 * 1024 * 1024;
+
 /// Default byte capacity of a file's chunk cache (64 MiB).
 pub const DEFAULT_CHUNK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Default number of chunk cache slots.
@@ -109,6 +125,19 @@ pub struct OpenOptions {
     /// before allocation. Default: [`DEFAULT_MAX_CHUNK_BYTES`]; values above
     /// [`HDF5_MAX_CHUNK_BYTES`] are clamped to it.
     pub max_chunk_bytes: usize,
+    /// Largest decoded selection (selected elements times the dataset's
+    /// element size) one read call may allocate, for `read_array*`,
+    /// `read_slice*`, `read_rows_columns_chunked*`, `read_raw_bytes`,
+    /// `read_native_bytes`, `read_string` and `read_strings`. Larger
+    /// selections are refused with [`Error::ResourceLimit`] before
+    /// allocation. Reads into caller-provided buffers are not limited.
+    /// Default: [`DEFAULT_MAX_READ_BYTES`] (unlimited).
+    pub max_read_bytes: usize,
+    /// Largest object header, summed over its first chunk and every
+    /// continuation chunk, the reader will read and parse. Larger headers
+    /// are refused with [`Error::ResourceLimit`] before the chunk that would
+    /// exceed the limit is read. Default: [`DEFAULT_MAX_OBJECT_HEADER_BYTES`].
+    pub max_object_header_bytes: usize,
 }
 
 impl Default for OpenOptions {
@@ -120,6 +149,8 @@ impl Default for OpenOptions {
             external_file_resolver: None,
             external_link_resolver: None,
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
+            max_read_bytes: DEFAULT_MAX_READ_BYTES,
+            max_object_header_bytes: DEFAULT_MAX_OBJECT_HEADER_BYTES,
         }
     }
 }
@@ -158,6 +189,18 @@ impl OpenOptions {
     /// Set [`OpenOptions::max_chunk_bytes`].
     pub fn with_max_chunk_bytes(mut self, max_chunk_bytes: usize) -> Self {
         self.max_chunk_bytes = max_chunk_bytes;
+        self
+    }
+
+    /// Set [`OpenOptions::max_read_bytes`].
+    pub fn with_max_read_bytes(mut self, max_read_bytes: usize) -> Self {
+        self.max_read_bytes = max_read_bytes;
+        self
+    }
+
+    /// Set [`OpenOptions::max_object_header_bytes`].
+    pub fn with_max_object_header_bytes(mut self, max_object_header_bytes: usize) -> Self {
+        self.max_object_header_bytes = max_object_header_bytes;
         self
     }
 }
@@ -492,6 +535,8 @@ pub(crate) struct FileContext {
     pub(crate) external_link_resolver: Option<Arc<dyn ExternalLinkResolver>>,
     pub(crate) external_file_cache: parking_lot::Mutex<HashMap<String, DynStorage>>,
     pub(crate) max_chunk_bytes: usize,
+    pub(crate) max_read_bytes: usize,
+    pub(crate) max_object_header_bytes: usize,
     sohm_table: OnceLock<std::result::Result<Option<SharedMessageTableRef>, String>>,
     full_file_cache: OnceLock<StorageBuffer>,
 }
@@ -526,16 +571,18 @@ impl FileContext {
             }
         }
 
-        let mut hdr = ObjectHeader::parse_at_storage(
+        let mut hdr = ObjectHeader::parse_at_storage_with_limit(
             self.storage.as_ref(),
             addr,
             self.superblock.offset_size,
             self.superblock.length_size,
+            self.max_object_header_bytes,
         )?;
         hdr.resolve_shared_messages_storage_with_sohm(
             self.storage.as_ref(),
             self.superblock.offset_size,
             self.superblock.length_size,
+            self.max_object_header_bytes,
             |heap_id, message_type| self.resolve_sohm_message(heap_id, message_type),
         )?;
         let arc = Arc::new(hdr);
@@ -552,16 +599,18 @@ impl FileContext {
         addr: u64,
     ) -> Result<(ObjectHeader, messages::CapturedEncodings)> {
         let capture = messages::RawCapture::start();
-        let mut hdr = ObjectHeader::parse_at_storage(
+        let mut hdr = ObjectHeader::parse_at_storage_with_limit(
             self.storage.as_ref(),
             addr,
             self.superblock.offset_size,
             self.superblock.length_size,
+            self.max_object_header_bytes,
         )?;
         hdr.resolve_shared_messages_storage_with_sohm(
             self.storage.as_ref(),
             self.superblock.offset_size,
             self.superblock.length_size,
+            self.max_object_header_bytes,
             |heap_id, message_type| self.resolve_sohm_message(heap_id, message_type),
         )?;
         Ok((hdr, capture.finish()))
@@ -601,11 +650,12 @@ impl FileContext {
         let Some(extension_address) = self.superblock.extension_address else {
             return Ok(None);
         };
-        let extension = ObjectHeader::parse_at_storage(
+        let extension = ObjectHeader::parse_at_storage_with_limit(
             self.storage.as_ref(),
             extension_address,
             self.superblock.offset_size,
             self.superblock.length_size,
+            self.max_object_header_bytes,
         )?;
 
         let shared_table = extension.messages.iter().find_map(|message| match message {
@@ -667,6 +717,8 @@ impl Hdf5File {
                 external_link_resolver,
                 external_file_cache: parking_lot::Mutex::new(HashMap::new()),
                 max_chunk_bytes: options.max_chunk_bytes.min(HDF5_MAX_CHUNK_BYTES),
+                max_read_bytes: options.max_read_bytes,
+                max_object_header_bytes: options.max_object_header_bytes,
                 sohm_table: OnceLock::new(),
                 full_file_cache: OnceLock::new(),
             }),
@@ -920,13 +972,17 @@ mod tests {
             .with_chunk_cache_bytes(1024)
             .with_chunk_cache_slots(7)
             .with_filter_registry(FilterRegistry::new())
-            .with_max_chunk_bytes(4096);
+            .with_max_chunk_bytes(4096)
+            .with_max_read_bytes(8192)
+            .with_max_object_header_bytes(16384);
         assert_eq!(opts.chunk_cache_bytes, 1024);
         assert_eq!(opts.chunk_cache_slots, 7);
         assert!(opts.filter_registry.is_some());
         assert!(opts.external_file_resolver.is_none());
         assert!(opts.external_link_resolver.is_none());
         assert_eq!(opts.max_chunk_bytes, 4096);
+        assert_eq!(opts.max_read_bytes, 8192);
+        assert_eq!(opts.max_object_header_bytes, 16384);
     }
 
     #[test]

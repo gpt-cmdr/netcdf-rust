@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- add `OpenOptions::max_read_bytes`, a limit on the decoded bytes one dataset
+  read may allocate, which is unlimited by default, and
+  `OpenOptions::max_object_header_bytes`, a limit on the bytes of one object
+  header across its continuation chunks, which defaults to 64 MiB. Both refuse
+  with `Error::ResourceLimit` before reading or allocating
+
 ### Fixed
 
 - reject datatypes with a zero element size (fixed-point, floating-point,
