@@ -710,3 +710,75 @@ fn from_bytes_api_also_handles_corruption() {
         "expected InvalidMagic via from_bytes, got: {err}"
     );
 }
+
+/// `simple_contiguous.h5` with its float64 datatype's size field set to
+/// `datatype_size`. With `huge_unwritten`, the 4x5 dataspace also becomes
+/// 2^20 x 2^20 and the contiguous storage size 0 (no data written), so every
+/// byte-length check sees 0 bytes.
+fn simple_contiguous_with_datatype_size(
+    datatype_size: u32,
+    huge_unwritten: bool,
+) -> Option<Vec<u8>> {
+    let mut bytes = fixture_bytes("simple_contiguous.h5")?;
+    let dataset_address = usize::try_from(
+        Hdf5File::from_vec(bytes.clone())
+            .unwrap()
+            .dataset("/data")
+            .unwrap()
+            .address(),
+    )
+    .unwrap();
+    // Datatype message: class/version byte, three flag bytes, then the size.
+    let datatype_class_offset = dataset_address + 72;
+    assert_eq!(bytes[datatype_class_offset] & 0x0f, 1);
+    let size_offset = datatype_class_offset + 4;
+    assert_eq!(bytes[size_offset..size_offset + 4], 8u32.to_le_bytes());
+    bytes[size_offset..size_offset + 4].copy_from_slice(&datatype_size.to_le_bytes());
+
+    if huge_unwritten {
+        let mut dims = 4u64.to_le_bytes().to_vec();
+        dims.extend_from_slice(&5u64.to_le_bytes());
+        let dims_offset = dataset_address
+            + find_bytes(&bytes[dataset_address..], &dims).expect("dataspace dimensions");
+        let side = 1u64 << 20;
+        bytes[dims_offset..dims_offset + 8].copy_from_slice(&side.to_le_bytes());
+        bytes[dims_offset + 8..dims_offset + 16].copy_from_slice(&side.to_le_bytes());
+        let storage_size_offset = dataset_address
+            + find_bytes(&bytes[dataset_address..], &160u64.to_le_bytes())
+                .expect("contiguous storage size");
+        bytes[storage_size_offset..storage_size_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+    }
+    Some(bytes)
+}
+
+#[test]
+fn zero_width_datatype_is_rejected() {
+    // Upstream, a zero-width element made every byte-length check vacuous
+    // (2^40 elements x 0 bytes = 0 bytes), so read_raw_bytes returned no bytes
+    // and read_array::<f64> tried to allocate 8 TiB and aborted.
+    let Some(bytes) = simple_contiguous_with_datatype_size(0, true) else {
+        eprintln!("SKIPPED: fixture simple_contiguous.h5 not found");
+        return;
+    };
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let err = expect_err(file.dataset("/data"));
+    assert!(
+        error_chain_contains_invalid_data(&err, "size 0"),
+        "expected zero-width datatype error, got: {err}"
+    );
+}
+
+#[test]
+fn datatype_size_wider_than_supported_is_not_truncated() {
+    // A 256-byte float used to be truncated to `size: 0` (and 264 to 8).
+    let Some(bytes) = simple_contiguous_with_datatype_size(256, false) else {
+        eprintln!("SKIPPED: fixture simple_contiguous.h5 not found");
+        return;
+    };
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let mut err = expect_err(file.dataset("/data"));
+    while let Error::Context { source, .. } = err {
+        err = *source;
+    }
+    assert!(matches!(err, Error::UnsupportedEncoding(_)), "{err}");
+}

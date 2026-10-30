@@ -567,6 +567,118 @@ fn chunks_larger_than_the_chunk_limit_are_refused() {
     assert_eq!(data.shape(), &[10, 20]);
 }
 
+fn is_resource_limit(err: &hdf5_reader::error::Error) -> bool {
+    let mut source = err;
+    while let hdf5_reader::error::Error::Context { source: inner, .. } = source {
+        source = inner;
+    }
+    matches!(source, hdf5_reader::error::Error::ResourceLimit(_))
+}
+
+#[test]
+fn reads_larger_than_the_read_limit_are_refused() {
+    // 10x20 float32 in 5x10 chunks: 800 bytes, 80 bytes per row.
+    let path = skip_if_missing!("simple_chunked_deflate.h5");
+    let open = |max_read_bytes| {
+        hdf5_reader::Hdf5File::open_with_options(
+            &path,
+            hdf5_reader::OpenOptions::default().with_max_read_bytes(max_read_bytes),
+        )
+        .unwrap()
+    };
+    let rows = |n| hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 0,
+                end: n,
+                step: 1,
+            },
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 0,
+                end: 20,
+                step: 1,
+            },
+        ],
+    };
+
+    let file = open(799);
+    let ds = file.dataset("/temperature").unwrap();
+    let err = ds.read_array::<f32>().unwrap_err();
+    assert!(is_resource_limit(&err), "{err}");
+    let err = ds.read_array_uncached::<f32>().unwrap_err();
+    assert!(is_resource_limit(&err), "{err}");
+    let err = ds.read_raw_bytes().unwrap_err();
+    assert!(is_resource_limit(&err), "{err}");
+    let err = ds.read_native_bytes().unwrap_err();
+    assert!(is_resource_limit(&err), "{err}");
+    let err = ds.read_slice::<f32>(&rows(10)).unwrap_err();
+    assert!(is_resource_limit(&err), "{err}");
+    let columns: Vec<u64> = (0..20).collect();
+    let err = ds
+        .read_rows_columns_chunked::<f32>((0, 10, 1), &columns)
+        .unwrap_err();
+    assert!(is_resource_limit(&err), "{err}");
+    #[cfg(feature = "rayon")]
+    {
+        let err = ds.read_array_parallel::<f32>().unwrap_err();
+        assert!(is_resource_limit(&err), "{err}");
+        let err = ds.read_slice_parallel::<f32>(&rows(10)).unwrap_err();
+        assert!(is_resource_limit(&err), "{err}");
+    }
+
+    // Smaller selections and caller-provided buffers are unaffected.
+    let part = ds.read_slice::<f32>(&rows(9)).unwrap();
+    assert_eq!(part.shape(), &[9, 20]);
+    let part = ds
+        .read_rows_columns_chunked::<f32>((0, 10, 1), &columns[..19])
+        .unwrap()
+        .unwrap();
+    assert_eq!(part.shape(), &[10, 19]);
+    let mut buffer = vec![0u8; 800];
+    ds.read_raw_bytes_into(&mut buffer).unwrap();
+
+    let file = open(800);
+    let data: ndarray::ArrayD<f32> = file.dataset("/temperature").unwrap().read_array().unwrap();
+    assert_eq!(data.shape(), &[10, 20]);
+    assert_eq!(
+        buffer,
+        file.dataset("/temperature")
+            .unwrap()
+            .read_raw_bytes()
+            .unwrap()
+    );
+}
+
+#[test]
+fn object_headers_larger_than_the_header_limit_are_refused() {
+    let path = skip_if_missing!("simple_contiguous.h5");
+    let open = |max_object_header_bytes| {
+        hdf5_reader::Hdf5File::open_with_options(
+            &path,
+            hdf5_reader::OpenOptions::default()
+                .with_max_object_header_bytes(max_object_header_bytes),
+        )
+        .unwrap()
+    };
+
+    // The root group's header obeys the limit too.
+    let file = open(16);
+    let err = match file.root_group().and_then(|root| root.members()) {
+        Err(err) => err,
+        Ok(_) => panic!("expected the root header to exceed the limit"),
+    };
+    assert!(is_resource_limit(&err), "{err}");
+    let err = match file.dataset("/data") {
+        Err(err) => err,
+        Ok(_) => panic!("expected the dataset header to exceed the limit"),
+    };
+    assert!(is_resource_limit(&err), "{err}");
+
+    let file = open(hdf5_reader::DEFAULT_MAX_OBJECT_HEADER_BYTES);
+    let data: ndarray::ArrayD<f64> = file.dataset("/data").unwrap().read_array().unwrap();
+    assert_eq!(data.shape(), &[4, 5]);
+}
+
 #[test]
 fn external_link_resolver() {
     let path = skip_if_missing!("external_links.h5");

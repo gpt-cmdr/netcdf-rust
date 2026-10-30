@@ -93,6 +93,26 @@ fn parse_datatype_description_at_depth(
     Ok((dt, size))
 }
 
+/// Reject a zero element size. libhdf5 refuses to create these classes with
+/// size 0, and a zero-width element makes every byte-length check of a read
+/// vacuous (any number of elements times 0 bytes is 0 bytes).
+fn nonzero_size(class: &str, size: u32) -> Result<u32> {
+    if size == 0 {
+        return Err(Error::InvalidData(format!("{class} datatype has size 0")));
+    }
+    Ok(size)
+}
+
+/// A nonzero element size that fits the `u8` size of the numeric datatypes,
+/// instead of truncating it (256 would become 0, 264 would become 8).
+fn small_size(class: &str, size: u32) -> Result<u8> {
+    u8::try_from(nonzero_size(class, size)?).map_err(|_| {
+        Error::UnsupportedEncoding(format!(
+            "{class} datatype of {size} bytes; at most 255 bytes are supported"
+        ))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Class 0: Fixed-point (integer)
 // ---------------------------------------------------------------------------
@@ -112,7 +132,7 @@ fn parse_fixed_point(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<D
     let _bit_precision = cursor.read_u16_le()?;
 
     Ok(Datatype::FixedPoint {
-        size: size as u8,
+        size: small_size("fixed-point", size)?,
         signed,
         byte_order,
     })
@@ -147,7 +167,7 @@ fn parse_floating_point(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Resul
     let _exp_bias = cursor.read_u32_le()?;
 
     Ok(Datatype::FloatingPoint {
-        size: size as u8,
+        size: small_size("floating-point", size)?,
         byte_order,
     })
 }
@@ -160,7 +180,7 @@ fn parse_time(cursor: &mut Cursor<'_>, size: u32) -> Result<Datatype> {
     // Properties: bit precision (u16)
     let _bit_precision = cursor.read_u16_le()?;
     Ok(Datatype::Opaque {
-        size,
+        size: nonzero_size("time", size)?,
         tag: "HDF5_TIME".to_string(),
     })
 }
@@ -209,7 +229,7 @@ fn parse_bitfield(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<Data
     let _bit_precision = cursor.read_u16_le()?;
 
     Ok(Datatype::Bitfield {
-        size: size as u8,
+        size: small_size("bitfield", size)?,
         byte_order,
     })
 }
@@ -219,6 +239,7 @@ fn parse_bitfield(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<Data
 // ---------------------------------------------------------------------------
 
 fn parse_opaque(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<Datatype> {
+    let size = nonzero_size("opaque", size)?;
     // The class flags encode the length of the tag (in the lower bits).
     let tag_len = (flags & 0xFF) as usize;
 
@@ -251,6 +272,7 @@ fn parse_compound(
     version: u8,
     depth: usize,
 ) -> Result<Datatype> {
+    let size = nonzero_size("compound", size)?;
     // Lower 16 bits of class flags = number of members
     let n_members = (flags & 0xFFFF) as usize;
     let byte_offset_size = compound_member_offset_size(size);
@@ -328,7 +350,7 @@ fn parse_reference(flags: u32, size: u32) -> Result<Datatype> {
 
     Ok(Datatype::Reference {
         ref_type,
-        size: size as u8,
+        size: small_size("reference", size)?,
     })
 }
 
@@ -420,7 +442,15 @@ fn parse_array(cursor: &mut Cursor<'_>, _size: u32, version: u8, depth: usize) -
 
     let mut dims = Vec::with_capacity(rank);
     for _ in 0..rank {
-        dims.push(cursor.read_u32_le()? as u64);
+        let dim = cursor.read_u32_le()?;
+        if dim == 0 {
+            // libhdf5 rejects zero-sized array dimensions; the element would
+            // be zero bytes wide.
+            return Err(Error::InvalidData(
+                "array datatype has a zero-sized dimension".into(),
+            ));
+        }
+        dims.push(u64::from(dim));
     }
 
     if version < 3 {
@@ -926,6 +956,64 @@ mod tests {
             }
             other => panic!("expected Bitfield, got {:?}", other),
         }
+    }
+
+    fn datatype_with_size(class: u8, flags: u32, size: u32, properties: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&class_word(class, 1, flags).to_le_bytes());
+        data.extend_from_slice(&size.to_le_bytes());
+        data.extend_from_slice(properties);
+        data
+    }
+
+    #[test]
+    fn zero_width_datatypes_are_rejected() {
+        let cases: [(&str, Vec<u8>); 7] = [
+            ("fixed-point", datatype_with_size(0, 0, 0, &[0; 4])),
+            ("floating-point", datatype_with_size(1, 0x20, 0, &[0; 12])),
+            ("time", datatype_with_size(2, 0, 0, &[0; 2])),
+            ("bitfield", datatype_with_size(4, 0, 0, &[0; 4])),
+            ("opaque", datatype_with_size(5, 0, 0, &[])),
+            ("compound", datatype_with_size(6, 0, 0, &[])),
+            ("reference", datatype_with_size(7, 0, 0, &[])),
+        ];
+        for (class, data) in cases {
+            let err = parse(&mut Cursor::new(&data), data.len()).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidData(message) if message == &format!("{class} datatype has size 0")),
+                "{class}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_sized_array_dimension_is_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&class_word(10, 3, 0).to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.push(1); // rank
+        data.extend_from_slice(&0u32.to_le_bytes()); // dimension 0
+        data.extend_from_slice(&datatype_with_size(0, 0, 4, &[0, 0, 32, 0]));
+        let err = parse(&mut Cursor::new(&data), data.len()).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidData(message) if message.contains("zero-sized dimension")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn numeric_datatype_sizes_are_not_truncated() {
+        for size in [256u32, 264] {
+            let data = datatype_with_size(0, 0, size, &[0; 4]);
+            let err = parse(&mut Cursor::new(&data), data.len()).unwrap_err();
+            assert!(matches!(err, Error::UnsupportedEncoding(_)), "{err}");
+        }
+        let data = datatype_with_size(0, 0, 255, &[0; 4]);
+        let msg = parse(&mut Cursor::new(&data), data.len()).unwrap();
+        assert!(matches!(
+            msg.datatype,
+            Datatype::FixedPoint { size: 255, .. }
+        ));
     }
 
     #[test]

@@ -1212,18 +1212,44 @@ impl Dataset {
         Ok(self.dataspace.num_elements()?)
     }
 
+    /// Refuse a read of `elements` elements whose decoded bytes exceed the
+    /// file's read limit, before anything is allocated for it.
+    fn check_read_budget(&self, elements: u64) -> Result<()> {
+        let limit = self.context.max_read_bytes;
+        if limit == usize::MAX {
+            return Ok(());
+        }
+        let elem_size = u64::try_from(self.raw_element_size()?).unwrap_or(u64::MAX);
+        let bytes = elements.saturating_mul(elem_size);
+        if bytes > u64::try_from(limit).unwrap_or(u64::MAX) {
+            return Err(Error::ResourceLimit(format!(
+                "read of {elements} elements ({bytes} bytes) exceeds the {limit} byte read limit"
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`Dataset::check_read_budget`] for the whole dataset.
+    fn check_full_read_budget(&self) -> Result<()> {
+        self.check_read_budget(self.num_elements()?)
+    }
+
     /// Read the entire dataset into an n-dimensional array.
     pub fn read_array<T: H5Type>(&self) -> Result<ArrayD<T>> {
-        let result = match &self.layout {
-            DataLayout::Compact { data } => self.read_compact::<T>(data),
-            DataLayout::Contiguous { address, size } => self.read_contiguous::<T>(*address, *size),
-            DataLayout::Chunked {
-                address,
-                dims,
-                element_size,
-                chunk_indexing,
-            } => self.read_chunked::<T>(*address, dims, *element_size, chunk_indexing.as_ref()),
-        };
+        let result = self
+            .check_full_read_budget()
+            .and_then(|()| match &self.layout {
+                DataLayout::Compact { data } => self.read_compact::<T>(data),
+                DataLayout::Contiguous { address, size } => {
+                    self.read_contiguous::<T>(*address, *size)
+                }
+                DataLayout::Chunked {
+                    address,
+                    dims,
+                    element_size,
+                    chunk_indexing,
+                } => self.read_chunked::<T>(*address, dims, *element_size, chunk_indexing.as_ref()),
+            });
         result.map_err(|e| e.with_context(&self.name))
     }
 
@@ -1268,6 +1294,7 @@ impl Dataset {
     /// Non-chunked datasets fall back to `read_array`.
     #[cfg(feature = "rayon")]
     pub fn read_array_parallel<T: H5Type>(&self) -> Result<ArrayD<T>> {
+        self.check_full_read_budget()?;
         match &self.layout {
             DataLayout::Chunked {
                 address,
@@ -1289,6 +1316,7 @@ impl Dataset {
     /// Non-chunked datasets fall back to `read_array`.
     #[cfg(feature = "rayon")]
     pub fn read_array_in_pool<T: H5Type>(&self, pool: &rayon::ThreadPool) -> Result<ArrayD<T>> {
+        self.check_full_read_budget()?;
         match &self.layout {
             DataLayout::Chunked {
                 address,
@@ -1314,6 +1342,7 @@ impl Dataset {
     #[cfg(feature = "rayon")]
     pub fn read_slice_parallel<T: H5Type>(&self, selection: &SliceInfo) -> Result<ArrayD<T>> {
         let resolved = normalize_selection(selection, &self.dataspace.dims)?;
+        self.check_read_budget(resolved.result_elements as u64)?;
 
         match &self.layout {
             DataLayout::Chunked {
@@ -1336,6 +1365,7 @@ impl Dataset {
     /// Read a hyperslab of the dataset.
     pub fn read_slice<T: H5Type>(&self, selection: &SliceInfo) -> Result<ArrayD<T>> {
         let resolved = normalize_selection(selection, &self.dataspace.dims)?;
+        self.check_read_budget(resolved.result_elements as u64)?;
 
         match &self.layout {
             DataLayout::Contiguous { address, size } => {
@@ -1370,6 +1400,7 @@ impl Dataset {
     /// Numeric values remain in the dataset datatype's byte order.
     pub fn read_raw_bytes(&self) -> Result<Vec<u8>> {
         let result: Result<Vec<u8>> = (|| {
+            self.check_full_read_budget()?;
             let total_bytes = self.raw_byte_len()?;
             let mut output = try_zeroed_bytes(total_bytes)?;
             self.read_raw_bytes_into_inner(&mut output)?;
@@ -1409,6 +1440,7 @@ impl Dataset {
     /// Read logical raw bytes converted to native-endian numeric fields.
     pub fn read_native_bytes(&self) -> Result<Vec<u8>> {
         let result: Result<Vec<u8>> = (|| {
+            self.check_full_read_budget()?;
             let total_bytes = self.raw_byte_len()?;
             let mut output = try_zeroed_bytes(total_bytes)?;
             self.read_raw_bytes_into_inner(&mut output)?;
@@ -2431,6 +2463,7 @@ impl Dataset {
         }
         let nr = checked_usize((rows.1 - rows.0).div_ceil(rows.2), "selected rows")?;
         let count = checked_mul_usize(nr, columns.len(), "gather elements")?;
+        self.check_read_budget(count as u64)?;
         let elem_size = self.raw_element_size()?;
         let len = checked_mul_usize(count, elem_size, "gather bytes")?;
         let mut output = self.make_output_buffer(len)?;
@@ -4581,6 +4614,8 @@ mod tests {
             external_link_resolver: None,
             external_file_cache: Mutex::new(HashMap::new()),
             max_chunk_bytes: crate::DEFAULT_MAX_CHUNK_BYTES,
+            max_read_bytes: crate::DEFAULT_MAX_READ_BYTES,
+            max_object_header_bytes: crate::DEFAULT_MAX_OBJECT_HEADER_BYTES,
             sohm_table: OnceLock::new(),
             full_file_cache: OnceLock::new(),
         })
