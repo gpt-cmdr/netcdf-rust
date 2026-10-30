@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- add `OpenOptions::max_read_bytes`, a limit on the decoded bytes one dataset
+  read may allocate, which is unlimited by default, and
+  `OpenOptions::max_object_header_bytes`, a limit on the bytes of one object
+  header across its continuation chunks, which defaults to 64 MiB. Both refuse
+  with `Error::ResourceLimit` before reading or allocating
+
+### Fixed
+
+- reject datatypes with a zero element size (fixed-point, floating-point,
+  time, bitfield, opaque, compound, and reference) and array datatypes with a
+  zero-sized dimension, as libhdf5 does. A zero-width element made every
+  byte-length check pass, so a large dataset read back as no bytes, or a typed
+  read aborted trying to allocate terabytes for its output
+- report numeric and reference datatypes wider than 255 bytes as unsupported
+  instead of truncating their size (256 bytes read as 0)
+
 ## 0.10.1 - 2026-10-28
 
 ### Improved

@@ -808,6 +808,8 @@ impl NcFile {
                             external_file_resolver: options.external_file_resolver,
                             external_link_resolver: options.external_link_resolver,
                             max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
+                            max_read_bytes: hdf5_reader::DEFAULT_MAX_READ_BYTES,
+                            max_object_header_bytes: hdf5_reader::DEFAULT_MAX_OBJECT_HEADER_BYTES,
                         },
                     )?;
                     let nc4 = nc4::Nc4File::from_hdf5(hdf5, metadata_mode)?;

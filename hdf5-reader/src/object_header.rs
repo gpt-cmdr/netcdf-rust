@@ -47,6 +47,32 @@ fn enter_continuation(visited: &mut std::collections::HashSet<u64>, offset: u64)
     Ok(())
 }
 
+/// Bytes of one object header still allowed to be read, across its chunks.
+struct HeaderBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl HeaderBudget {
+    fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    /// Account for a header chunk of `len` bytes before it is read.
+    fn take(&mut self, len: usize) -> Result<()> {
+        match self.used.checked_add(len) {
+            Some(used) if used <= self.limit => {
+                self.used = used;
+                Ok(())
+            }
+            _ => Err(Error::ResourceLimit(format!(
+                "object header exceeds the {} byte header limit",
+                self.limit
+            ))),
+        }
+    }
+}
+
 /// Header continuation message type id.
 const MSG_TYPE_CONTINUATION: u16 = 0x0010;
 
@@ -106,6 +132,20 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Self> {
+        Self::parse_at_storage_with_limit(storage, address, offset_size, length_size, usize::MAX)
+    }
+
+    /// [`ObjectHeader::parse_at_storage`], refusing with
+    /// [`Error::ResourceLimit`] a header whose chunks, first and continuation,
+    /// total more than `max_bytes`. Each chunk is checked before it is read.
+    pub fn parse_at_storage_with_limit(
+        storage: &dyn Storage,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+        max_bytes: usize,
+    ) -> Result<Self> {
+        let mut budget = HeaderBudget::new(max_bytes);
         let prefix = storage.read_range(address, 4)?;
         if prefix.len() < 4 {
             return Err(Error::UnexpectedEof {
@@ -116,9 +156,9 @@ impl ObjectHeader {
         }
 
         if prefix.as_ref()[..4] == OHDR_SIGNATURE {
-            Self::parse_v2_storage(storage, address, offset_size, length_size)
+            Self::parse_v2_storage(storage, address, offset_size, length_size, &mut budget)
         } else {
-            Self::parse_v1_storage(storage, address, offset_size, length_size)
+            Self::parse_v1_storage(storage, address, offset_size, length_size, &mut budget)
         }
     }
 
@@ -177,6 +217,7 @@ impl ObjectHeader {
         storage: &dyn Storage,
         offset_size: u8,
         length_size: u8,
+        max_header_bytes: usize,
         mut resolve_sohm: F,
     ) -> Result<()>
     where
@@ -189,12 +230,22 @@ impl ObjectHeader {
                 HdfMessage::Shared(SharedMessage::SharedInOhdr {
                     message_type,
                     address,
-                }) => match Self::parse_at_storage(storage, address, offset_size, length_size) {
+                }) => match Self::parse_at_storage_with_limit(
+                    storage,
+                    address,
+                    offset_size,
+                    length_size,
+                    max_header_bytes,
+                ) {
                     Ok(target_header) => {
                         if let Some(target_msg) = select_shared_message(target_header, message_type)
                         {
                             resolved.push(target_msg);
                         }
+                    }
+                    Err(err @ Error::ResourceLimit(_)) => {
+                        self.messages = resolved;
+                        return Err(err);
                     }
                     Err(_) => {
                         resolved.push(HdfMessage::Shared(SharedMessage::SharedInOhdr {
@@ -300,6 +351,7 @@ impl ObjectHeader {
         address: u64,
         offset_size: u8,
         length_size: u8,
+        budget: &mut HeaderBudget,
     ) -> Result<Self> {
         let header = storage.read_range(address, 16)?;
         let mut cursor = Cursor::new(header.as_ref());
@@ -318,6 +370,7 @@ impl ObjectHeader {
         let header_data_size = checked_usize(header_data_size, "v1 object header data size")?;
         let first_chunk_len =
             checked_add_usize(16, header_data_size, "v1 object header chunk length")?;
+        budget.take(first_chunk_len)?;
         let first_chunk = storage.read_range(address, first_chunk_len)?;
         let mut messages = Vec::with_capacity(num_messages as usize);
         let mut continuations = Vec::new();
@@ -333,6 +386,7 @@ impl ObjectHeader {
         while let Some((cont_offset, cont_length)) = continuations.pop() {
             enter_continuation(&mut visited, cont_offset)?;
             let cont_length = checked_usize(cont_length, "v1 object header continuation length")?;
+            budget.take(cont_length)?;
             let chunk = storage.read_range(cont_offset, cont_length)?;
             Self::read_v1_messages_from_slice(
                 chunk.as_ref(),
@@ -552,6 +606,7 @@ impl ObjectHeader {
         address: u64,
         offset_size: u8,
         length_size: u8,
+        budget: &mut HeaderBudget,
     ) -> Result<Self> {
         let fixed_prefix = storage.read_range(address, 6)?;
         let mut cursor = Cursor::new(fixed_prefix.as_ref());
@@ -619,6 +674,7 @@ impl ObjectHeader {
 
         let chunk_with_checksum_len =
             checked_add_usize(chunk0_end, 4, "v2 object header chunk0 checksum end")?;
+        budget.take(chunk_with_checksum_len)?;
         let chunk = storage.read_range(address, chunk_with_checksum_len)?;
         let stored_checksum = u32::from_le_bytes(
             chunk.as_ref()[chunk0_end..chunk0_end + 4]
@@ -647,6 +703,10 @@ impl ObjectHeader {
         let mut visited = std::collections::HashSet::new();
         while let Some((cont_offset, cont_length)) = continuations.pop() {
             enter_continuation(&mut visited, cont_offset)?;
+            budget.take(checked_usize(
+                cont_length,
+                "v2 object header continuation length",
+            )?)?;
             Self::read_v2_continuation_chunk_storage(
                 storage,
                 cont_offset,
@@ -1643,6 +1703,32 @@ mod tests {
             err.to_string().contains("continuation cycle"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn storage_header_limit_counts_continuation_chunks() {
+        // A 40-byte first chunk (prefix + one continuation message) and a
+        // 1008-byte continuation chunk holding one nil message.
+        let first_chunk_len = 16 + 8 + 16;
+        let cont_chunk_len = 8 + 1000;
+        let mut cont_payload = Vec::new();
+        cont_payload.extend_from_slice(&(first_chunk_len as u64).to_le_bytes());
+        cont_payload.extend_from_slice(&(cont_chunk_len as u64).to_le_bytes());
+        let mut file_data = build_v1_header(&[(MSG_TYPE_CONTINUATION, 0, &cont_payload)], 1);
+        assert_eq!(file_data.len(), first_chunk_len);
+        file_data.extend_from_slice(&MSG_TYPE_NIL.to_le_bytes());
+        file_data.extend_from_slice(&1000u16.to_le_bytes());
+        file_data.extend_from_slice(&[0u8; 4 + 1000]);
+        let storage = BytesStorage::new(file_data);
+        let total = first_chunk_len + cont_chunk_len;
+
+        for limit in [first_chunk_len - 1, total - 1] {
+            let err =
+                ObjectHeader::parse_at_storage_with_limit(&storage, 0, 8, 8, limit).unwrap_err();
+            assert!(matches!(err, Error::ResourceLimit(_)), "{limit}: {err}");
+        }
+        let header = ObjectHeader::parse_at_storage_with_limit(&storage, 0, 8, 8, total).unwrap();
+        assert_eq!(header.messages.len(), 2);
     }
 
     #[test]
